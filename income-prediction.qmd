@@ -1,0 +1,3751 @@
+---
+title: "IE 477 – Income Prediction "
+author: "Arda Noyan Karaşoğlu"
+format:
+  html:
+    embed-resources: true
+    toc: true
+editor: visual
+---
+
+# 1. Setup and Library Loading
+
+```{r}
+library(readxl)
+library(readr)
+library(tidyverse)
+library(tidymodels)
+library(rsample)
+library(car)
+library(MASS)
+library(tidymodels) 
+library(bonsai)
+library(rpart.plot)  
+library(vip)
+library(pdp)
+library(glmnet)
+library(DiagrammeR)
+library(dplyr)
+library(shiny)
+
+
+set.seed(123)
+
+
+```
+
+# 2. Data Loading and Cleaning
+
+```{r}
+df <- read_excel("data/synthetic_customers.xlsx")
+df[df == -999999999999.99] <- NA
+df[df == -999999] <- NA
+df[df == 19000101] <- NA
+df[df == -999999.0] <- NA
+glimpse(df)
+colnames(df)
+
+```
+
+# 3. Missing Value Analysis
+
+```{r}
+na_counts <- sapply(df, function(x) sum(is.na(x)))
+na_counts[na_counts > 0]
+```
+
+```{r}
+
+library(visdat)
+
+
+df %>%
+  dplyr::select(where(~ any(is.na(.)))) %>%  
+  vis_miss() +
+  labs(title = "Map of Missing Values") +
+  theme(axis.text.x = element_text(angle = 90, size = 6)) 
+
+
+```
+
+# 4. Exploratory Data Analysis (EDA)
+
+This section provides a systematic overview of the dataset including missing values, variable types, descriptive statistics, and distributional properties.
+
+Missing value report
+
+```{r}
+na_report <- data.frame(
+  variable = names(df),
+  na_count = sapply(df, function(x) sum(is.na(x))),
+  na_ratio = sapply(df, function(x) mean(is.na(x)))
+)
+
+
+na_report %>% 
+  filter(na_count > 0) %>% 
+  arrange(desc(na_ratio))
+```
+
+#### **Identify numerical and categorical variables**
+
+```{r}
+numeric_vars <- df %>%
+select_if(is.numeric)
+
+categorical_vars <- df %>%
+select_if(function(x) is.character(x) | is.factor(x))
+
+glimpse(numeric_vars)
+glimpse(categorical_vars)
+
+```
+
+#### **Descriptive statistics**
+
+```{r}
+numeric_summary <- numeric_vars %>%
+pivot_longer(cols = everything(),
+names_to = "variable",
+values_to = "value") %>%
+group_by(variable) %>%
+summarise(
+n = sum(!is.na(value)),
+mean = mean(value, na.rm = TRUE),
+sd = sd(value, na.rm = TRUE),
+min = min(value, na.rm = TRUE),
+q1 = quantile(value, 0.25, na.rm = TRUE),
+median = median(value, na.rm = TRUE),
+q3 = quantile(value, 0.75, na.rm = TRUE),
+max = max(value, na.rm = TRUE)
+)
+
+numeric_summary
+
+```
+
+Distribution of numeric variables
+
+```{r}
+# 4.2 Distribution of key numeric variables (target + main predictors)
+
+key_vars <- c(
+  "Edevlet_Net_Gelir",   # Target: e-Government net income
+  "HF_CUSTOMER_AGE",     # Age
+  "KKB_SCORE",           # Credit bureau score
+  "KKB_CC_UTIL_RATIO"    # Credit card utilization
+)
+
+df %>%
+  # Make sure these variables are numeric (in case they were read as character)
+  dplyr::mutate(
+    dplyr::across(
+      .cols = all_of(key_vars),
+      .fns  = ~ suppressWarnings(as.numeric(.x))
+    )
+  ) %>%
+  dplyr::select(all_of(key_vars)) %>%
+  tidyr::pivot_longer(
+    cols      = everything(),
+    names_to  = "variable",
+    values_to = "value"
+  ) %>%
+  tidyr::drop_na() %>%
+  ggplot2::ggplot(ggplot2::aes(x = value)) +
+  ggplot2::geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  ggplot2::facet_wrap(~ variable, scales = "free") +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title    = "Distribution of Key Numeric Variables",
+    subtitle = "Income, age and KKB-related variables show clear skewness and potential outliers.",
+    x        = "Value",
+    y        = "Count"
+  )
+```
+
+```{r}
+# --- STEP 1: Prepare the Data Object ---
+# We create a clean dataframe named 'model_data' first.
+# This fixes the "object not found" error by ensuring the object exists.
+
+model_data <- df %>%
+  dplyr::select(
+    Edevlet_Net_Gelir,     # Target Variable
+    HF_CUSTOMER_AGE,       # Age
+    KKB_SCORE,             # Credit Score
+    Model_Gelir,           # Modeled Income
+    KKB_CC_UTIL_RATIO      # Credit Card Ratio
+  ) %>%
+  # Convert all selected columns to numeric
+  mutate(across(everything(), as.numeric)) %>%
+  # Clean masked values (replace -999... and placeholder dates with NA)
+  mutate(across(everything(), ~ ifelse(. < -900000 | . == 19000101, NA, .))) %>%
+  # Remove empty rows
+  na.omit()
+
+# --- STEP 2: Create the Plots ---
+
+# Method 1: Zoomed Histogram (Income < 200,000 TL)
+
+model_data %>%
+  filter(Edevlet_Net_Gelir < 230000) %>%  # Filter out extreme outliers for better visibility
+  ggplot(aes(x = Edevlet_Net_Gelir)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  labs(title = "Income Distribution (Zoomed: < 200k TL)",
+       subtitle = "Excluding extreme outliers",
+       x = "Income (TL)", y = "Count") +
+  theme_minimal()
+
+# Method 2: Logarithmic Scale (Scientific Method)
+# This allows us to see the entire distribution including outliers
+ggplot(model_data, aes(x = Edevlet_Net_Gelir)) +
+  geom_histogram(bins = 30, fill = "orange", color = "white") +
+  scale_x_log10(labels = scales::comma) + # Log transformation for skewed data
+  labs(title = "Income Distribution (Logarithmic Scale)",
+       subtitle = "Corrects for right-skewness",
+       x = "Income (Log Scale)", y = "Count") +
+  theme_minimal()
+```
+
+Applying a log-scale to the income variable reveals a highly right-skewed distribution, with the majority of applicants concentrated around moderate income levels and a long right tail representing high-income individuals. This transformation is crucial for improving interpretability and model stability.
+
+Restricting the range to incomes below 200,000 TL exposes the underlying clustering behavior caused by salary brackets and reporting patterns. The distribution still displays a heavy right skew even after removing extreme outliers.
+
+```{r}
+tier_counts <- df %>%
+  dplyr::filter(!is.na(Tier)) %>%      
+  dplyr::count(Tier, name = "n")
+
+ggplot(tier_counts, aes(x = "", y = n, fill = as.factor(Tier))) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  geom_text(
+    aes(label = paste0(round(n / sum(n) * 100, 1), "%")),
+    position = position_stack(vjust = 0.5),
+    size = 4
+  ) +
+  scale_fill_brewer(palette = "Set3", name = "Tier") +
+  labs(
+    title    = "Tier Distribution Across All Applicants",
+    subtitle = "Shows the representation of Tier categories in the full dataset",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_void()
+
+```
+
+```{r}
+
+df %>%
+  mutate(
+    Edevlet_Net_Gelir            = as.numeric(Edevlet_Net_Gelir),
+    HF_APPLICANT_EMPLOYMENT_STATUS = as.factor(HF_APPLICANT_EMPLOYMENT_STATUS),
+    KKB_CC_OPEN_TOT_LIM_AMT      = as.numeric(KKB_CC_OPEN_TOT_LIM_AMT)
+  ) %>%
+  filter(
+    !is.na(HF_APPLICANT_EMPLOYMENT_STATUS),
+    !is.na(KKB_CC_OPEN_TOT_LIM_AMT),
+    Edevlet_Net_Gelir > 0
+  ) %>%
+  ggplot(aes(x = HF_APPLICANT_EMPLOYMENT_STATUS,
+             y = KKB_CC_OPEN_TOT_LIM_AMT)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7, outlier.alpha = 0.3) +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    title    = "Credit Card Limit by Employment Status",
+    subtitle = "Higher limits are concentrated in more stable employment categories",
+    x        = "Employment Status",
+    y        = "Credit Card Limit (log scale, TL)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+```
+
+```{r}
+# --- 5. Lorenz Curve of Income (Inequality Analysis) ---
+
+# Load package (do NOT reinstall inside the document)
+library(ineq)
+
+# Extract clean income vector from raw data
+income_vec <- df$Edevlet_Net_Gelir %>% 
+  as.numeric()
+
+# Keep only positive, valid incomes
+income_vec <- income_vec[ income_vec > 0 & !is.na(income_vec) ]
+
+# Compute Lorenz curve
+lorenz_obj <- Lc(income_vec)
+
+# Plot Lorenz curve
+plot(
+  lorenz_obj,
+  main = "Lorenz Curve of Household Income",
+  xlab = "Cumulative Share of Customers",
+  ylab = "Cumulative Share of Income",
+  lwd  = 2,
+  col  = "darkblue"
+)
+
+# Add equality line
+abline(0, 1, lty = 2, col = "red")
+
+# Gini coefficient
+gini_val <- ineq(income_vec, type = "Gini")
+cat("Gini Coefficient:", round(gini_val, 3), "\n")
+
+
+```
+
+# 5.0 Create a cleaned modelling dataset
+
+```{r}
+
+model_data <- df %>%
+mutate(
+edevlet_net_gelir = as.numeric(Edevlet_Net_Gelir),
+hf_customer_age = as.numeric(HF_CUSTOMER_AGE),
+kkb_score = as.numeric(KKB_SCORE),
+kkb_cc_util_ratio = as.numeric(KKB_CC_UTIL_RATIO)
+)
+```
+
+## 5.1 Boxplots of the target variable
+
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(readr)
+
+# 1) Ana veri seti
+df <- read_excel("data/synthetic_customers.xlsx")
+
+rent_raw <- read_excel(
+  "data/il_ortalama_kira.xlsx",
+  sheet = "kira_verileri_canli_kayit"
+)
+
+# 3) İl bazında ortalama kira
+kira_il <- rent_raw %>%
+  transmute(
+    il_upper = str_to_upper(Column1, locale = "tr"),
+    kira_il  = readr::parse_number(
+      Column3,
+      locale = locale(decimal_mark = ",", grouping_mark = ".")
+    )
+  ) %>%
+  group_by(il_upper) %>%
+  summarise(
+    kira_il_ortalama = mean(kira_il, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 4) Kira bilgilerini df'ye merge et
+df <- df %>%
+  mutate(
+    Il_upper = str_to_upper(`İkamet İl`, locale = "tr")
+  ) %>%
+  left_join(
+    kira_il,
+    by = c("Il_upper" = "il_upper")
+  )
+
+# 5) Kontrol – artık df'de kira_il_ortalama var mı?
+names(df)[grepl("kira", names(df))]
+
+df %>%
+  dplyr::select(`İkamet İl`, Il_upper, kira_il_ortalama) %>%
+  head()
+
+
+```
+
+```{r}
+# --- 1. MASTER DATA PREPARATION (WIDE, CLEAN DATASET) ---
+
+model_data_new <- df %>%
+  dplyr::select(
+    # --- Target variable ---
+    Edevlet_Net_Gelir,
+    
+    # --- Core demographic and score variables ---
+    HF_CUSTOMER_AGE,
+    KKB_SCORE,
+    HF_EDUCATION,
+    HF_APPLICANT_EMPLOYMENT_STATUS,
+    
+    # --- Financial status and assets ---
+    KKB_CC_UTIL_RATIO,
+    KKB_CC_OPEN_TOT_LIM_AMT,
+    HF_AVG_ASSET_CURR_ACC_L3M,
+    HF_ASSET_PRTCPATION_ACC_L3M,
+    KKB_CUST_TENURE,
+    HF_Odeyebilecegi_Taksit_Tutari,
+    
+    # --- Application & location related variables ---
+    KKB_TOT_APP_CNT_L12M,
+    `İkamet İl`,
+    Tier,
+    HF_APPLICANT_PROFESSION_CODE,
+    
+    # --- Detailed KKB variables used in ML models ---
+    KKB_CC_OPEN_MAX_LIM_AMT,
+    KKB_CL_TOT_RISK_AMT,
+    KKB_MORTG_TOT_RISK_AMT,
+    KKB_CC_TOT_MONTHLY_PAYM_AMT,
+    KKB_NON_DELQ_ACCT_CNT,
+    KKB_CC_OPEN_CNT,
+    KKB_CC_ACCT_CNT,
+    KKB_CURR_DELQ_DAY_CNT,
+    KKB_CURR_TOT_FOLLOW_AMT,
+    KKB_DELQ_ACCT_CNT,
+
+    
+    # --- New rent feature merged from external file ---
+    kira_il_ortalama
+  ) %>%
+  
+  # 1) Clean income: cast to numeric and remove clearly invalid or low values
+  mutate(
+    Edevlet_Net_Gelir = suppressWarnings(as.numeric(Edevlet_Net_Gelir))
+  ) %>%
+  filter(
+    !is.na(Edevlet_Net_Gelir),
+    Edevlet_Net_Gelir >= 23000      # exclude very low reported income
+  ) %>%
+  
+  # 2) Convert numeric-like character columns to numeric
+  mutate(across(
+    c(
+      HF_CUSTOMER_AGE,
+      KKB_SCORE,
+      KKB_CC_UTIL_RATIO,
+      KKB_CC_OPEN_TOT_LIM_AMT,
+      HF_AVG_ASSET_CURR_ACC_L3M,
+      KKB_CUST_TENURE,
+      HF_Odeyebilecegi_Taksit_Tutari,
+      KKB_TOT_APP_CNT_L12M,
+      KKB_CC_OPEN_MAX_LIM_AMT,
+      KKB_CL_TOT_RISK_AMT,
+      KKB_MORTG_TOT_RISK_AMT,
+      KKB_CC_TOT_MONTHLY_PAYM_AMT,
+      KKB_NON_DELQ_ACCT_CNT,
+      KKB_CC_OPEN_CNT,
+      KKB_CC_ACCT_CNT,
+      KKB_CURR_DELQ_DAY_CNT,
+      KKB_CURR_TOT_FOLLOW_AMT,
+      KKB_DELQ_ACCT_CNT,
+      kira_il_ortalama
+    ),
+    ~ suppressWarnings(as.numeric(as.character(.)))
+  )) %>%
+  
+  # 3) Replace masked / sentinel values with NA
+  mutate(
+    across(
+      where(is.numeric),
+      ~ ifelse(. < -900000 | . == 19000101, NA, .)
+    )
+  ) %>%
+  
+  # 4) Drop rows with missing values
+  #    (required for standard linear regression)
+  na.omit()
+
+
+# --- 2. STANDARDIZATION, LOG-TRANSFORMS AND FEATURE ENGINEERING ---
+
+model_data_scaled <- model_data_new %>%
+  mutate(
+    # 1) Ensure all continuous variables are numeric (defensive casting)
+    Edevlet_Net_Gelir            = as.numeric(Edevlet_Net_Gelir),
+    HF_CUSTOMER_AGE              = as.numeric(HF_CUSTOMER_AGE),
+    KKB_SCORE                    = as.numeric(KKB_SCORE),
+    KKB_CC_UTIL_RATIO            = as.numeric(KKB_CC_UTIL_RATIO),
+    KKB_CC_OPEN_TOT_LIM_AMT      = as.numeric(KKB_CC_OPEN_TOT_LIM_AMT),
+    HF_AVG_ASSET_CURR_ACC_L3M    = as.numeric(HF_AVG_ASSET_CURR_ACC_L3M),
+    HF_ASSET_PRTCPATION_ACC_L3M  = as.numeric(HF_ASSET_PRTCPATION_ACC_L3M),
+    KKB_CUST_TENURE              = as.numeric(KKB_CUST_TENURE),
+    HF_Odeyebilecegi_Taksit_Tutari = as.numeric(HF_Odeyebilecegi_Taksit_Tutari),
+    KKB_TOT_APP_CNT_L12M         = as.numeric(KKB_TOT_APP_CNT_L12M),
+    KKB_CC_OPEN_MAX_LIM_AMT      = as.numeric(KKB_CC_OPEN_MAX_LIM_AMT),
+    KKB_CL_TOT_RISK_AMT          = as.numeric(KKB_CL_TOT_RISK_AMT),
+    KKB_MORTG_TOT_RISK_AMT       = as.numeric(KKB_MORTG_TOT_RISK_AMT),
+    KKB_CC_TOT_MONTHLY_PAYM_AMT  = as.numeric(KKB_CC_TOT_MONTHLY_PAYM_AMT),
+    KKB_NON_DELQ_ACCT_CNT        = as.numeric(KKB_NON_DELQ_ACCT_CNT),
+    KKB_CC_OPEN_CNT              = as.numeric(KKB_CC_OPEN_CNT),
+    KKB_CC_ACCT_CNT              = as.numeric(KKB_CC_ACCT_CNT),
+    KKB_CURR_DELQ_DAY_CNT        = as.numeric(KKB_CURR_DELQ_DAY_CNT),
+    KKB_CURR_TOT_FOLLOW_AMT      = as.numeric(KKB_CURR_TOT_FOLLOW_AMT),
+    kira_il_ortalama             = as.numeric(kira_il_ortalama)
+  ) %>%
+  
+  # 2) Keep only strictly positive income values for log-transform
+  filter(
+    !is.na(Edevlet_Net_Gelir),
+    Edevlet_Net_Gelir > 0
+  ) %>%
+  
+  mutate(
+    # 3) Log-transformed target (used in linear regression models)
+    log_income = log(Edevlet_Net_Gelir),
+    
+    # 4) Log-transformed rent feature (log(1 + x) to handle zeros)
+    t_RentIl   = log1p(kira_il_ortalama),
+    
+    # 5) Z-score standardization of key continuous predictors
+    z_HF_CUSTOMER_AGE              = as.numeric(scale(HF_CUSTOMER_AGE)),
+    z_KKB_SCORE                    = as.numeric(scale(KKB_SCORE)),
+    z_KKB_CC_UTIL_RATIO            = as.numeric(scale(KKB_CC_UTIL_RATIO)),
+    z_KKB_CC_OPEN_TOT_LIM_AMT      = as.numeric(scale(KKB_CC_OPEN_TOT_LIM_AMT)),
+    z_HF_AVG_ASSET_CURR_ACC_L3M    = as.numeric(scale(HF_AVG_ASSET_CURR_ACC_L3M)),
+    z_HF_ASSET_PRTCPATION_ACC_L3M  = as.numeric(scale(HF_ASSET_PRTCPATION_ACC_L3M)),
+    z_KKB_CUST_TENURE              = as.numeric(scale(KKB_CUST_TENURE)),
+    z_HF_Odeyebilecegi_Taksit_Tutari = as.numeric(scale(HF_Odeyebilecegi_Taksit_Tutari)),
+    z_KKB_TOT_APP_CNT_L12M         = as.numeric(scale(KKB_TOT_APP_CNT_L12M)),
+    z_KKB_CC_OPEN_MAX_LIM_AMT      = as.numeric(scale(KKB_CC_OPEN_MAX_LIM_AMT)),
+    z_KKB_CL_TOT_RISK_AMT          = as.numeric(scale(KKB_CL_TOT_RISK_AMT)),
+    z_KKB_MORTG_TOT_RISK_AMT       = as.numeric(scale(KKB_MORTG_TOT_RISK_AMT)),
+    z_KKB_CC_TOT_MONTHLY_PAYM_AMT  = as.numeric(scale(KKB_CC_TOT_MONTHLY_PAYM_AMT)),
+    z_KKB_NON_DELQ_ACCT_CNT        = as.numeric(scale(KKB_NON_DELQ_ACCT_CNT)),
+    z_KKB_CC_OPEN_CNT              = as.numeric(scale(KKB_CC_OPEN_CNT)),
+    z_KKB_CC_ACCT_CNT              = as.numeric(scale(KKB_CC_ACCT_CNT)),
+    z_KKB_CURR_DELQ_DAY_CNT        = as.numeric(scale(KKB_CURR_DELQ_DAY_CNT)),
+    z_KKB_CURR_TOT_FOLLOW_AMT      = as.numeric(scale(KKB_CURR_TOT_FOLLOW_AMT)),
+    
+    # 6) Short aliases (for more readable model formulas)
+    z_Age    = z_HF_CUSTOMER_AGE,
+    z_Score  = z_KKB_SCORE,
+    z_Util   = z_KKB_CC_UTIL_RATIO,
+    z_Limit  = z_KKB_CC_OPEN_TOT_LIM_AMT,
+    z_Asset  = z_HF_AVG_ASSET_CURR_ACC_L3M,
+    z_Tenure = z_KKB_CUST_TENURE,
+    
+    # 7) Additional engineered numeric features
+    t_PaymentCap = log(HF_Odeyebilecegi_Taksit_Tutari + 1),
+    z_AppCount   = as.numeric(scale(KKB_TOT_APP_CNT_L12M)),
+    t_MaxLimit   = log1p(KKB_CC_OPEN_MAX_LIM_AMT),
+    t_FollowAmt  = log1p(KKB_CURR_TOT_FOLLOW_AMT),
+    t_RiskAmt    = log1p(KKB_CL_TOT_RISK_AMT),
+    
+    # 8) City grouping: İstanbul, Ankara, İzmir vs Other
+    f_City = factor(
+      ifelse(`İkamet İl` %in% c("İSTANBUL", "ANKARA", "İZMİR"),
+             `İkamet İl`, "Other")
+    ),
+    
+    # 9) Categorical encodings (factors for regression / ML)
+    f_Education  = as.factor(HF_EDUCATION),
+    f_EmpStatus  = as.factor(HF_APPLICANT_EMPLOYMENT_STATUS),
+    f_Tier       = as.factor(Tier)
+  ) %>%
+  
+  # 10) Final NA removal for modeling
+  na.omit()
+
+
+```
+
+The boxplot summarizes the central tendency and extreme values of income using a log-scaled axis to correct for right-skewness. While the box occupies the middle range of the distribution, numerous outliers appear on both ends due to the highly discrete and heavy-tailed structure of the income variable. The unusual appearance is expected: income is not continuous and is frequently reported in fixed brackets, causing many identical values to fall outside the whiskers. Despite this, the boxplot effectively highlights the skewness and presence of extreme values in the dataset.
+
+The violin plot visualizes the full density of the income distribution on a logarithmic scale. Because income values in this dataset fall into discrete salary tiers rather than forming a smooth continuous distribution, the violin plot captures these clusters more accurately than a boxplot. The plot clearly displays a concentrated mass of mid-income applicants and a long right tail representing higher-income individuals. The multiple “bulges’’ along the violin reflect the banded, discretized nature of reported income.
+
+```{r}
+model_data %>%
+  filter(edevlet_net_gelir > 0) %>%
+  ggplot(aes(x = "", y = edevlet_net_gelir)) +
+  geom_violin(fill = "steelblue", alpha = 0.7) +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    title = "Income Distribution – Violin Plot (Log Scale)",
+    subtitle = "Violin plots handle discrete income levels much better",
+    x = NULL,
+    y = "Income (log scale)"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+library(patchwork) 
+
+# 1. Original Distribution (Skewed)
+p1 <- ggplot(model_data, aes(x = edevlet_net_gelir)) +
+  geom_histogram(fill = "#69b3a2", color = "white", bins = 50) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(
+    title = "Original Income Distribution",
+    x = "Net Income (TL)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+# 2. Log-Transformed Distribution (Approx. Normal)
+p2 <- ggplot(model_data, aes(x = log(edevlet_net_gelir))) +
+  geom_histogram(fill = "#404080", color = "white", bins = 50) +
+  labs(
+    title = "Log-Transformed Income",
+    x = "Log(Income)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+# 3. Combine (patchwork)
+p1 + p2
+
+```
+
+## 5.2 Bivariate relationships with income
+
+The scatterplots and LOESS curves indicate clear non-linear patterns between income and predictors such as age, credit card utilization and KKB score. Therefore, relying on a simple linear fit is inadequate. Based on these patterns, transformations such as Age², log-limit, log-utilization, and √score were deemed necessary to linearize relationships before model estimation.
+
+### 5.2.1 Age vs Income
+
+```{r}
+model_data %>%
+filter(edevlet_net_gelir > 0) %>%
+drop_na(hf_customer_age) %>%
+ggplot(aes(x = hf_customer_age, y = edevlet_net_gelir)) +
+geom_point(alpha = 0.3) +
+geom_smooth(method = "loess", se = FALSE, color = "red") +
+scale_y_log10(labels = scales::comma) +
+labs(
+title = "Age vs Income",
+subtitle = "Income is plotted on a log scale to correct for skewness",
+x = "Customer Age",
+y = "Income (log scale)"
+) +
+theme_minimal()
+
+```
+
+### 5.2.2 KKB Score vs Income
+
+```{r}
+model_data %>%
+filter(edevlet_net_gelir > 0) %>%
+drop_na(kkb_score) %>%
+ggplot(aes(x = kkb_score, y = edevlet_net_gelir)) +
+geom_point(alpha = 0.3) +
+geom_smooth(method = "loess", se = FALSE, color = "red") +
+scale_y_log10(labels = scales::comma) +
+labs(
+title = "KKB Score vs Income",
+subtitle = "Non-linear relationship is smoothed via LOESS",
+x = "KKB Score",
+y = "Income (log scale)"
+) +
+theme_minimal()
+
+```
+
+### 5.2.3 Credit Card Utilization vs Income
+
+```{r}
+model_data %>%
+filter(edevlet_net_gelir > 0) %>%
+drop_na(kkb_cc_util_ratio) %>%
+ggplot(aes(x = kkb_cc_util_ratio, y = edevlet_net_gelir)) +
+geom_point(alpha = 0.3) +
+geom_smooth(method = "loess", se = FALSE, color = "red") +
+scale_y_log10(labels = scales::comma) +
+labs(
+title = "Credit Card Utilization vs Income",
+subtitle = "High utilization may be associated with specific income ranges",
+x = "Credit Card Utilization Ratio",
+y = "Income (log scale)"
+) +
+theme_minimal()
+
+```
+
+## 5.2.4Categorical Insights
+
+### 5.2.4.1 Income by Employment Status (Median + Count)
+
+```{r}
+income_empstatus <- df %>%
+  mutate(
+    Edevlet_Net_Gelir = as.numeric(Edevlet_Net_Gelir),
+    f_EmpStatus       = as.factor(HF_APPLICANT_EMPLOYMENT_STATUS)
+  ) %>%
+ 
+  filter(!is.na(Edevlet_Net_Gelir),
+         Edevlet_Net_Gelir >= 23000) %>%
+  group_by(f_EmpStatus) %>%
+  summarise(
+    n_obs         = n(),
+    median_income = median(Edevlet_Net_Gelir, na.rm = TRUE),
+    .groups       = "drop"
+  ) %>%
+  arrange(desc(median_income))
+
+# Plotting the results
+ggplot(income_empstatus,
+       aes(x = reorder(f_EmpStatus, median_income),
+           y = median_income)) +
+  geom_col(fill = "purple", color = "black") +
+  geom_text(aes(label = scales::comma(round(median_income, 0))),
+            hjust = -0.1, size = 3.5) +
+  scale_y_log10(labels = scales::comma) +
+  coord_flip() +
+  labs(
+    title    = "Median Income by Employment Status",
+    subtitle = "Calculated on raw data (filtered to income ≥ 20,000 TL)",
+    x        = "Employment Status",
+    y        = "Median Income (log scale, TL)"
+  ) +
+  theme_light()
+
+
+```
+
+### 5.2.4.2 Income Distribution by Education Level
+
+```{r}
+
+
+model_data_edu <- df %>%
+  mutate(
+    Edevlet_Net_Gelir = as.numeric(Edevlet_Net_Gelir),
+    f_Education       = as.factor(HF_EDUCATION)
+  ) %>%
+  filter(!is.na(Edevlet_Net_Gelir),
+         Edevlet_Net_Gelir > 0)
+
+model_data_edu %>%
+  ggplot(aes(x = f_Education, y = Edevlet_Net_Gelir)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    title    = "Income Distribution by Education Level",
+    x        = "Education Level",
+    y        = "Income (log scale)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+
+```
+
+### 5.2.4.3 Age Categories
+
+```{r}
+
+
+model_data_eda <- df %>%
+  mutate(
+    age_group = cut(
+      HF_CUSTOMER_AGE,
+      breaks = c(18, 25, 35, 45, 55, 65, Inf),
+      labels = c("18–25", "26–35", "36–45", "46–55", "56–65", "65+"),
+      right = TRUE
+    )
+  )
+
+# 7.X.1 Count by Age Group
+model_data_eda %>%
+  count(age_group) %>%
+  ggplot(aes(x = age_group, y = n)) +
+  geom_col(fill = "#69b3a2") +
+  geom_text(aes(label = n), vjust = -0.3) +
+  labs(
+    title = "Distribution of Customers by Age Group",
+    x     = "Age Group",
+    y     = "Count"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+### 5.2.4.3 Income by Age Group
+
+```{r}
+
+model_data_eda %>%             
+  filter(Edevlet_Net_Gelir > 0) %>%
+  group_by(age_group) %>%
+  summarise(
+    median_income = median(Edevlet_Net_Gelir, na.rm = TRUE),
+    n             = n()
+  ) %>%
+  ggplot(aes(x = age_group, y = median_income)) +
+  geom_col(fill = "orange", color = "black") +
+  geom_text(aes(label = scales::comma(round(median_income, 0))),
+            vjust = -0.3, size = 3) +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    title    = "Median Income by Age Group",
+    subtitle = "Lifecycle pattern of income on a log scale",
+    x        = "Age Group",
+    y        = "Median Income (log scale)"
+  ) +
+  theme_minimal()
+
+```
+
+### 5.2.4.4 Dominant Employment Patterns in Higher-Income Segments
+
+```{r}
+
+
+df_high <- model_data_scaled %>%
+  filter(Edevlet_Net_Gelir > 23000) %>%
+  count(f_EmpStatus) %>%
+  mutate(
+    perc = n / sum(n) * 100,
+    label = paste0(f_EmpStatus, " (", sprintf("%.1f%%", perc), ")")
+  )
+
+ggplot(df_high, aes(x = "", y = perc, fill = as.factor(f_EmpStatus))) +
+  geom_col(color = "white", width = 1) +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(label = sprintf("%.1f%%", perc)),
+    position = position_stack(vjust = 0.5),
+    size = 5
+  ) +
+  labs(
+    title = "Employment Status Distribution for Higher-Income Applicants",
+    fill  = "Employment Status"
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 12),
+    legend.text  = element_text(size = 10)
+  )
+
+
+```
+
+```{r}
+par(mfrow = c(1,2))
+
+plot(model_data_scaled$HF_CUSTOMER_AGE, 
+     model_data_scaled$log_income,
+     pch=16, col=rgb(0,0,0,0.2),
+     main="Raw Age vs Log-Income")
+
+# Quadratic fit
+plot(model_data_scaled$HF_CUSTOMER_AGE,
+     model_data_scaled$log_income,
+     pch=16, col=rgb(0,0,0,0.2),
+     main="Quadratic Fit: Age + Age²")
+curve(predict(lm(log_income ~ HF_CUSTOMER_AGE + I(HF_CUSTOMER_AGE^2),
+                 data=model_data_scaled),
+              data.frame(HF_CUSTOMER_AGE=x)),
+      add=TRUE, col="red", lwd=2)
+
+```
+
+```{r}
+par(mfrow = c(1,2))
+
+plot(model_data_scaled$KKB_CC_OPEN_TOT_LIM_AMT,
+     model_data_scaled$log_income,
+     pch=16, col=rgb(0,0,0,0.2),
+     main="Raw Limit vs Log-Income")
+
+plot(log(model_data_scaled$KKB_CC_OPEN_TOT_LIM_AMT + 1),
+     model_data_scaled$log_income,
+     pch=16, col=rgb(0,0,0,0.2),
+     main="Log(Limit) vs Log-Income")
+
+```
+
+## 5.3 Correlation of numeric variables with income
+
+```{r}
+# Select numeric variables
+
+numeric_vars <- model_data %>%
+dplyr::select(where(is.numeric))
+
+# Compute correlations with income
+
+corr_income <- numeric_vars %>%
+dplyr::select(-edevlet_net_gelir) %>%
+summarise(across(
+.cols = everything(),
+.fns  = ~ cor(.x, numeric_vars$edevlet_net_gelir,
+use = "pairwise.complete.obs")
+)) %>%
+pivot_longer(
+cols      = everything(),
+names_to  = "variable",
+values_to = "correlation"
+) %>%
+arrange(desc(abs(correlation)))
+
+head(corr_income, 20)
+
+```
+
+### 5.3.1 Correlation of Numeric Predictors with Income
+
+```{r}
+corr_income %>%
+  # 1) Target ve leakage kolonlarını dışla
+  filter(
+    !grepl("^(Edevlet_|Final_|Beyan_|Model_)", variable),
+    variable != "Edevlet_Net_Gelir"     # target'ı özellikle çıkar
+  ) %>%
+  # 2) En yüksek 15 korelasyonu al
+  slice_max(order_by = abs(correlation), n = 15) %>%
+  mutate(variable = reorder(variable, correlation)) %>%
+  ggplot(aes(x = variable, y = correlation)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "",
+    x = "Variable",
+    y = "Correlation with Income"
+  ) +
+  theme_minimal()
+
+
+```
+
+### 5.3.2 Correlation Heatmap (Numeric Variables)
+
+```{r}
+
+
+library(tidyverse)
+
+num_for_corr <- model_data_scaled %>%
+  dplyr::select(
+    log_income,
+    HF_CUSTOMER_AGE,
+    KKB_SCORE,
+    KKB_CC_UTIL_RATIO,
+    KKB_CC_OPEN_TOT_LIM_AMT,
+    HF_AVG_ASSET_CURR_ACC_L3M,
+    KKB_CUST_TENURE
+  )
+
+corr_mat <- cor(num_for_corr, use = "pairwise.complete.obs")
+
+corr_df <- as.data.frame(corr_mat) %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "corr")
+
+ggplot(corr_df, aes(x = var1, y = var2, fill = corr)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "darkred", mid = "white", high = "darkblue", midpoint = 0
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Correlation Heatmap of Key Numeric Variables",
+    x     = "",
+    y     = "",
+    fill  = "Correlation"
+  )
+
+```
+
+## 5.4 Model Architecture Overview
+
+```{r}
+
+
+grViz("
+digraph model_flow {
+
+  graph [rankdir = LR, fontsize = 10]
+
+  node [shape = rectangle, style = filled, fillcolor = '#f5f5f5',
+        fontname = 'Helvetica', fontsize = 10]
+
+  # Nodes
+  A [label = 'Raw Data\n(KKB + HF + e-Devlet)']
+  B [label = 'Cleaning &\nLeakage Removal']
+  C [label = 'Full OLS\n(diagnostic only)']
+  D [label = 'LASSO\n(feature selection)']
+  E [label = 'Reduced OLS\n(explainability)']
+  F [label = 'Transformed OLS\n(stepwise OLS)']
+  G [label = 'ML Models\n(Tree / RF / kNN /\nXGBoost / LightGBM)']
+  H [label = 'Best Model\n(XGBoost on hold-out)']
+
+  # Edges
+  A -> B
+  B -> C
+  C -> D
+  D -> E
+
+  B -> F
+  B -> G
+  G -> H
+}
+")
+
+```
+
+# **6.0 Full Multiple Regression Model (ALL Predictors NEW)**
+
+In this section, we fit a multiple linear regression model using **all available predictors** in the dataset.\
+The goal is to:
+
+1.  Use the full feature set (after cleaning and preprocessing),
+
+2.  Quantify the overall explanatory power of all predictors together,
+
+3.  Diagnose multicollinearity and model assumptions,
+
+4.  Justify the need for later feature reduction and model refinement.
+
+```{r}
+
+# 5.0 – Clean master dataset 
+
+df_master <- df %>%
+
+  mutate(Edevlet_Net_Gelir = as.numeric(Edevlet_Net_Gelir)) %>%
+
+  filter(!is.na(Edevlet_Net_Gelir),
+         Edevlet_Net_Gelir >= 23000) %>%
+
+  mutate(across(
+    c(
+      HF_CUSTOMER_AGE,
+      KKB_SCORE,
+      KKB_CC_UTIL_RATIO,
+      KKB_CC_OPEN_TOT_LIM_AMT,
+      HF_AVG_ASSET_CURR_ACC_L3M,
+      HF_ASSET_PRTCPATION_ACC_L3M,
+      KKB_CUST_TENURE,
+      HF_Odeyebilecegi_Taksit_Tutari,
+      KKB_TOT_APP_CNT_L12M,
+      KKB_CC_OPEN_MAX_LIM_AMT,
+      KKB_CL_TOT_RISK_AMT,
+      KKB_MORTG_TOT_RISK_AMT,
+      KKB_CC_TOT_MONTHLY_PAYM_AMT,
+      KKB_NON_DELQ_ACCT_CNT,
+      KKB_CC_OPEN_CNT,
+      KKB_CC_ACCT_CNT,
+      KKB_CURR_DELQ_DAY_CNT,
+      KKB_CURR_TOT_FOLLOW_AMT
+    ),
+    ~ suppressWarnings(as.numeric(.))
+  )) %>%
+  # Masked değerleri temizle
+  mutate(across(where(is.numeric),
+                ~ ifelse(. < -900000 | . == 19000101, NA, .))) %>%
+  # E-devlet değişkenlerinden sadece target'ı bırak
+  {
+    ede_cols  <- grep("^Edevlet_", names(.), value = TRUE)
+    ede_drop  <- setdiff(ede_cols, "Edevlet_Net_Gelir")
+    dplyr::select(., -all_of(ede_drop))
+  } %>%
+  # Leakage / teknik kolonları at
+  dplyr::select(
+    -starts_with("Model_"),
+    -starts_with("Beyan_"),
+    -starts_with("Final"),
+    -matches("(?i)karar"),
+    -matches("(?i)hash"),
+    -matches("(?i)ref")
+  ) %>%
+  # Target'ı başa al
+  dplyr::select(Edevlet_Net_Gelir, dplyr::everything()) %>%
+  # Tamamen NA'lı satırları at
+  na.omit()
+
+df_master <- df_master %>%
+  left_join(
+    kira_il,
+    by = c("İkamet İl" = "il_upper")
+  ) %>%
+  filter(Edevlet_Net_Gelir > 0) %>%
+  mutate(
+    log_income = log(Edevlet_Net_Gelir)
+  )
+
+df_master %>%
+  distinct(`İkamet İl`) %>%
+  anti_join(kira_il, by = c("İkamet İl" = "il_upper"))
+
+
+
+df_master <- df_master %>%
+  filter(Edevlet_Net_Gelir > 0) %>%             # güvenlik amaçlı
+  mutate(
+    log_income = log(Edevlet_Net_Gelir)
+  )
+
+
+
+
+```
+
+```{r}
+
+
+df_full <- df_master   
+
+full_rec <- recipe(Edevlet_Net_Gelir ~ ., data = df_master) %>%
+  step_log(all_outcomes()) %>%
+  step_rm(Edevlet_Net_Gelir) %>%                     
+  step_impute_median(all_numeric_predictors()) %>%   
+  step_unknown(all_nominal_predictors(), new_level = "missing") %>% 
+  step_other(all_nominal_predictors(), threshold = 0.02) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+
+full_prep <- prep(full_rec)
+full_data <- juice(full_prep)
+
+print(dim(full_data))
+
+if (nrow(full_data) > ncol(full_data)) {
+  full_lm_all <- lm(log_income ~ ., data = full_data)
+  summary(full_lm_all)
+} else {
+  message("Full OLS is saturated (p >> n); used only as diagnostic. 
+Proceed to LASSO in Section 6.2 for variable selection.")
+}
+
+
+```
+
+The full OLS model becomes saturated after dummy encoding, resulting in more predictors than observations.\
+This leads to zero residual degrees of freedom and undefined coefficient statistics (NaN standard errors and t-values).\
+Such behavior is expected in high-dimensional datasets and highlights severe multicollinearity and overparameterization.\
+Therefore, the full model is useful only as a diagnostic starting point and strongly motivates variable reduction techniques such as stepwise AIC, regularization (LASSO), and tree-based ML models.
+
+## 6.0.1 Diagnostics for the Full Model
+
+```{r}
+# Optional: basic dimension diagnostics
+n_obs    <- nrow(full_data)
+n_params <- length(coef(full_lm_all))
+model_rank <- full_lm_all$rank
+
+cat("Number of observations: ", n_obs, "\n")
+cat("Number of parameters (incl. intercept): ", n_params, "\n")
+cat("Model rank: ", model_rank, "\n")
+
+
+```
+
+Three predictors were aliased (perfectly collinear with other regressors) and were removed before computing VIF values. VIF diagnostics indicate substantial multicollinearity among several credit and income variables, which is expected given the highly engineered banking dataset.
+
+```{r}
+# --- 6.1.1 Multicollinearity Diagnostics (Aliasing + VIF) ---
+
+library(car)
+
+# 1. Find aliased (perfectly collinear) terms
+aliased_terms <- names(coef(full_lm_all))[is.na(coef(full_lm_all))]
+aliased_terms
+
+# 2. Refit model without aliased predictors
+full_lm_noalias <- update(
+  full_lm_all,
+  as.formula(
+    paste("log_income ~ . -", paste(aliased_terms, collapse = " - "))
+  )
+)
+
+# 3. VIFs on de-aliased model
+vif_full <- vif(full_lm_noalias)
+
+summary(vif_full)
+sort(vif_full, decreasing = TRUE)[1:20]
+
+
+```
+
+Instead of manually dropping high-VIF predictors, we relied on LASSO as a data-driven screening tool.\
+LASSO was first applied on the full dummy-encoded design matrix, and we retained only predictors with non-zero coefficients.\
+This two-step procedure preserves interpretability (standard errors, t-statistics, F-tests) while controlling multicollinearity in a principled way.
+
+```{r}
+# 1) Select numeric columns
+df_num <- df_master %>%
+  mutate(Edevlet_Net_Gelir = as.numeric(Edevlet_Net_Gelir))
+
+df_num <- df_num[, sapply(df_num, is.numeric)]
+
+# 2) Define Target
+y_income <- df_num$Edevlet_Net_Gelir
+
+# 3) Define Leakage Patterns
+# We exclude columns that imply the target or post-decision outcomes.
+remove_patterns <- c(
+  "log_income",
+  "^Final",
+  "^Model",
+  "^Beyan",
+  "^Edevlet_", # Exclude other E-devlet fields
+  "^Ihtiyac",
+  "Gelir"      # Exclude other income fields
+)
+
+# 4) Safely remove target and leakage columns
+cols_to_remove <- c("Edevlet_Net_Gelir", "ID")
+cols_to_remove <- intersect(cols_to_remove, names(df_num))
+
+predictor_df <- df_num %>%
+  dplyr::select(
+    -all_of(cols_to_remove),
+    -dplyr::matches(paste(remove_patterns, collapse = "|"))
+  )
+
+# 5) Calculate Correlations
+corr_df <- predictor_df %>%
+  summarise(across(everything(),
+                   ~ cor(.x, y_income, use = "pairwise.complete.obs"))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "correlation"
+  ) %>%
+  mutate(abs_corr = abs(correlation)) %>%
+  arrange(desc(abs_corr)) %>%
+  slice_head(n = 30)
+
+# 6) List Top 30 Variables
+print(corr_df$variable)
+
+# 7) Visualize with Heatmap
+ggplot(corr_df,
+       aes(x = "Edevlet_Net_Gelir",
+           y = reorder(variable, correlation),
+           fill = correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "darkred",
+    mid = "white",
+    high = "darkblue",
+    midpoint = 0
+  ) +
+  labs(
+    title = "Top 30 Correlations with Actual Income",
+    subtitle = "Variables ranked by absolute correlation (Leakage variables removed)",
+    x = "",
+    y = "Predictor",
+    fill = "Corr"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid = element_blank()
+  )
+```
+
+## 6.0.2 LASSO Regression with Feature Selection (UPDATED)
+
+**t_PaymentCap** represents the log-transformed monthly installment capacity. Tree-based models identified payment capacity as the dominant predictive signal,so we engineered a smooth transformation that LASSO could capture.This explains why t_PaymentCap emerges as the strongest predictor in the linear model.
+
+```{r}
+
+
+lasso_rec <- recipe(log_income ~ ., data = model_data_scaled) %>%
+  
+  # 1) Remove target + leakage variables
+  step_rm(
+    Edevlet_Net_Gelir, 
+    starts_with("Edevlet_"),
+    starts_with("Model_"),
+    starts_with("Beyan_"),
+    matches("(?i)final"),
+    matches("(?i)karar")
+  ) %>%
+  
+  # 2) Simplify high-cardinality categoricals
+  step_other(f_Education, threshold = 0.03) %>%
+  step_other(f_EmpStatus, threshold = 0.03) %>%
+  step_other(f_City,      threshold = 0.03) %>%
+  step_other(f_Tier,      threshold = 0.03) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  
+  # 3) Hand-crafted non-linear & interaction features
+  step_mutate(
+    # A) Ratio-based credit capacity features
+    avg_limit_per_card = KKB_CC_OPEN_TOT_LIM_AMT / pmax(KKB_CC_OPEN_CNT, 1),
+    limit_ratio        = KKB_CC_OPEN_MAX_LIM_AMT / pmax(KKB_CC_OPEN_TOT_LIM_AMT, 1),
+    taksit_yuk_oran    = HF_Odeyebilecegi_Taksit_Tutari / pmax(KKB_CC_OPEN_TOT_LIM_AMT, 1),
+
+    # B) Limit-based segmentation thresholds (numeric flags)
+    t_lim_mid  = if_else(KKB_CC_OPEN_TOT_LIM_AMT >  50000, 1, 0),
+    t_lim_high = if_else(KKB_CC_OPEN_TOT_LIM_AMT > 100000, 1, 0),
+    t_lim_vip  = if_else(KKB_CC_OPEN_TOT_LIM_AMT > 200000, 1, 0),
+
+    # C) Non-linear transforms the trees hinted at
+    age2          = z_Age^2,
+    log_limit_raw = log(KKB_CC_OPEN_TOT_LIM_AMT + 1),
+    log_util_raw  = log(KKB_CC_UTIL_RATIO + 0.001),
+    sqrt_score    = sqrt(KKB_SCORE),
+
+    # D) Interaction between payment capacity and normalized limit
+    paycap_x_limit = t_PaymentCap * z_Limit
+  ) %>%
+  
+  # 4) Drop zero-variance predictors
+  step_zv(all_predictors()) %>%
+  
+  # 5) Standardize all numeric predictors (required for LASSO)
+  step_normalize(all_numeric_predictors())
+
+
+# LASSO specification (fixed penalty here; can also be tuned via grid)
+lasso_spec <- linear_reg(
+  penalty = 0.01,
+  mixture = 1          # mixture = 1 → pure LASSO (L1 penalty)
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+lasso_wf <- workflow() %>%
+  add_recipe(lasso_rec) %>%
+  add_model(lasso_spec)
+
+# Fit LASSO on the prepared data
+lasso_fit <- fit(lasso_wf, data = model_data_scaled)
+
+# Extract non-zero coefficients selected by LASSO
+lasso_fit_parsnip <- extract_fit_parsnip(lasso_fit)
+
+lasso_results <- tidy(lasso_fit_parsnip) %>%
+  filter(term != "(Intercept)", estimate != 0) %>%
+  arrange(desc(abs(estimate)))
+
+cat("\n--- Selected Predictors by LASSO (λ = 0.01) ---\n")
+print(lasso_results)
+
+# Plot the top 20 selected predictors by absolute coefficient size
+lasso_results %>%
+  slice_head(n = 20) %>%
+  ggplot(aes(x = reorder(term, estimate), y = estimate, fill = estimate > 0)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title    = "LASSO Regression: Top 20 Predictors",
+    subtitle = "E-government income variables excluded; selection is based on KKB & HF features only",
+    x        = "Variable",
+    y        = "Coefficient Estimate",
+    fill     = "Positive Effect"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation of LASSO Results**
+
+The LASSO model, estimated after excluding all e-Government variables and potential leakage features, produced a compact set of predictors driven entirely by KKB and HF operational data. The strongest positive contributors to predicted income were *HF_Odeyebilecegi_Taksit_Tutari*, *Basvuru_Skoru*, and several credit-behavior indicators such as *KKB_Risk_L12M* and *KKB_NON_DELQ_ACCT_CNT*. These variables capture repayment capacity, borrowing discipline, and overall creditworthiness—attributes typically associated with higher-income applicants. In contrast, negative coefficients emerged for features reflecting existing financial burden or elevated risk levels, including *HF_APP_INST_AMT*, KKB delinquency metrics, lower-tier customer segments (e.g., Tier T5/T6), and asset-related volatility measures. Overall, the LASSO framework effectively removed multicollinearity and retained only the most informative, stable predictors. The resulting feature set indicates that income variation in the absence of e-Government data is primarily explained by repayment ability, historical credit performance, and customer risk tier, making these variables strong candidates for downstream modeling and business decision-making.
+
+## 6.0.3 LASSO-Screened Reduced OLS Model
+
+To translate the LASSO screening into a more interpretable and regulation-friendly specification, we re-estimated a standard OLS model using only the predictors selected by LASSO. Concretely, we first applied the LASSO recipe (with dummy encoding and standardization) to obtain a reduced design matrix and then retained only variables with non-zero LASSO coefficients. Starting from this compact set, we iteratively removed aliased predictors and dropped the worst high-VIF terms until all remaining regressors satisfied a conservative multicollinearity threshold (VIF ≤ 10).
+
+```{r}
+# --- LASSO → Reduced OLS Helper Function (Clean & Working Version) ---
+
+build_reduced_ols <- function(lasso_rec, lasso_results, vif_threshold = 10) {
+  
+  library(dplyr)
+  library(broom)
+  library(car)
+  library(ggplot2)
+  library(recipes)
+  
+  cat("\n[1] Preparing design matrix from LASSO recipe...\n")
+  lasso_prep  <- prep(lasso_rec, training = model_data_scaled)
+  design_data <- juice(lasso_prep)
+  
+  if (!"log_income" %in% names(design_data)) {
+    stop("`log_income` must be present in the design matrix as the outcome.")
+  }
+  
+  # --- 2. Extract non-zero LASSO coefficients ---
+  cat("\n[2] Extracting non-zero LASSO coefficients...\n")
+  selected_terms <- lasso_results %>%
+    filter(term != "(Intercept)", estimate != 0) %>%
+    pull(term) %>%
+    unique()
+  
+  keep_terms <- intersect(selected_terms, colnames(design_data))
+  cat("   → LASSO selected", length(selected_terms), "vars. Found", 
+      length(keep_terms), "in design matrix.\n")
+  
+  df_reduced <- design_data %>%
+    dplyr::select(log_income, all_of(keep_terms))
+  
+  # --- 3. Fit initial OLS ---
+  cat("\n[3] Fitting initial Reduced OLS model...\n")
+  ols_fit <- lm(log_income ~ ., data = df_reduced)
+  
+  # --- 4. Remove aliased terms ---
+  aliased_terms <- names(coef(ols_fit))[is.na(coef(ols_fit))]
+  if (length(aliased_terms) > 0) {
+    cat("   → Removing aliased terms:\n")
+    print(aliased_terms)
+    ols_fit <- update(ols_fit, as.formula(
+      paste("log_income ~ . -", paste(aliased_terms, collapse = " - "))
+    ))
+  }
+  
+  # --- 5. Iterative VIF reduction ---
+  cat("\n[4] Iterative VIF reduction (threshold =", vif_threshold, ")...\n")
+  repeat {
+    vifs <- tryCatch(car::vif(ols_fit), error = function(e) NULL)
+    if (is.null(vifs)) break
+    
+    high_vifs <- names(vifs)[vifs > vif_threshold]
+    if (length(high_vifs) == 0) {
+      cat("   → All predictors below VIF threshold.\n")
+      break
+    }
+    
+    var_to_drop <- high_vifs[which.max(vifs[high_vifs])]
+    cat("   → Dropping", var_to_drop, "with VIF =", round(vifs[var_to_drop], 2), "\n")
+    ols_fit <- update(ols_fit, as.formula(paste("log_income ~ . -", var_to_drop)))
+  }
+  
+  # --- 6. Final model summary ---
+  cat("\n[5] Final Reduced OLS model summary:\n")
+  print(summary(ols_fit))
+  
+  # --- 7. Coefficient Plot ---
+  ols_tidy <- broom::tidy(ols_fit) %>% arrange(p.value)
+  
+  coef_plot <- ols_tidy %>%
+    filter(term != "(Intercept)") %>%
+    slice_head(n = 20) %>%
+    mutate(signif = p.value < 0.05, 
+           term = reorder(term, estimate)) %>%
+    ggplot(aes(x = term, y = estimate, fill = signif)) +
+    geom_col() +
+    coord_flip() +
+    labs(title = "Final OLS Coefficients (LASSO → VIF Cleaned)",
+         x = "Predictor", y = "Coefficient", fill = "Significant?") +
+    theme_minimal()
+  
+  print(coef_plot)
+  
+  # --- Return outputs ---
+  return(invisible(list(
+    model = ols_fit,
+    data  = df_reduced,
+    tidy  = ols_tidy
+  )))
+}
+
+
+
+# Build Reduced OLS model based on LASSO-selected predictors
+reduced_ols_result <- build_reduced_ols(
+  lasso_rec     = lasso_rec,
+
+  lasso_results = lasso_results,
+  vif_threshold = 10
+)
+
+# Extract and inspect final OLS model
+reduced_ols_model <- reduced_ols_result$model
+summary(reduced_ols_model)
+
+```
+
+The reduced OLS model, constructed by screening variables through LASSO and then eliminating multicollinearity via iterative VIF reduction, highlights a concise set of predictors that explain variation in log-income without relying on any e-Government fields or post-decision information.
+
+The strongest positive contributors are **HF_Odeyebilecegi_Taksit_Tutari**, **Başvuru_Skoru**, **Talep_Limit**, and recent credit-risk measures such as **KKB_Risk_L12M** and **KKB_NON_DELQ_ACCT_CNT**. These variables collectively capture repayment capacity, the applicant’s internal creditworthiness assessment, and consistent repayment behavior—factors typically associated with higher reported income.
+
+Negative coefficients are dominated by delinquency-related and burden-related indicators, including **KKB_ALL_CC_DELQ_CNT_L12M**, **KKB_CURR_CC_DELQ_AMT**, and **HF_APP_INST_AMT**, as well as higher-risk customer tiers (**Tier_T5**, **Tier_T6**). These features reflect financial stress, accumulated obligations, and subsegment risk classifications, which are logically associated with lower income profiles.
+
+## 6.1 Base modelling dataset
+
+## 
+
+We exclude all observations with income below 23,000 TL, since these values are implausible in practice and most likely correspond to under-reported or erroneous entries. Including them would distort the income distribution and harm model performance.
+
+### 6.1 Base model (no interactions yet)
+
+```{r}
+# 6.1 – Updated Full Multiple Regression Model
+
+full_model <- lm(
+  log_income ~ 
+    
+    # --- Core life-cycle effects ---
+    z_Age + I(z_Age^2) +
+    
+    # --- Core creditworthiness predictors ---
+    z_Score +
+    z_Util +
+    z_Limit +
+    z_Asset +
+    z_Tenure +
+    
+    # --- Engineered numeric predictors ---
+    t_PaymentCap +         # Ability to pay (log)
+    z_AppCount +           # Application intensity
+    t_MaxLimit +           # Max CC limit (log)
+    t_FollowAmt +          # Follow-up balance (log)
+    t_RiskAmt +            # Consumer-loan risk (log)
+    
+    # --- Additional standardized behavioural variables ---
+    z_KKB_CC_OPEN_MAX_LIM_AMT +
+    z_KKB_CC_OPEN_CNT +
+    z_KKB_CC_ACCT_CNT +
+    z_KKB_CURR_DELQ_DAY_CNT +
+    z_KKB_NON_DELQ_ACCT_CNT +
+    z_KKB_CC_TOT_MONTHLY_PAYM_AMT +
+    z_KKB_MORTG_TOT_RISK_AMT +
+    z_KKB_CL_TOT_RISK_AMT +
+    
+    # --- Categorical predictors ---
+    f_Education +
+    f_EmpStatus +
+    f_City +
+    f_Tier +
+
+    
+    
+    # --- Interaction: education modifies age slope ---
+    f_Education * z_Age,
+  
+  data = model_data_scaled
+)
+
+summary(full_model)
+
+
+```
+
+The base model uses log-transformed income as the dependent variable and combines standardized numeric predictors (age, age squared, KKB score, credit card utilization and customer tenure) with key categorical descriptors (education, employment status and job title). **Age enters the model both linearly and quadratically** to allow for a non-linear income profile over the life cycle.
+
+Coefficients for the main numeric predictors are generally statistically significant and have the expected signs: higher KKB score and longer customer tenure are associated with higher reported income, whereas extreme credit card utilization may be linked to specific risk segments. The categorical effects capture structural differences across education and occupation groups that are not explained by pure credit history. Overall, the base model explains a non-trivial share of the variation in log-income while remaining interpretable and aligned with business intuition.
+
+### 6.2.0 Simple regression model and diagnostics
+
+```{r}
+
+
+# We use the cleaned and standardized dataset 'model_data_scaled' created in Step 5.0.
+# This ensures we are using the correct variable names (z_Age, z_Limit, etc.) and Log-Income.
+
+# 6.1 – Updated Full Multiple Regression Model (with engineered + standardized predictors)
+
+lm_fit <- lm(
+  log_income ~ 
+    # --- Core life-cycle effects (standardized age) ---
+    z_Age + I(z_Age^2) +
+    
+    # --- Core creditworthiness predictors (aliases from z_ variables) ---
+    z_Score +        # KKB score
+    z_Util +         # CC utilization ratio
+    z_Limit +        # Total CC limit
+    z_Asset +        # Avg asset in current accounts (L3M)
+    z_Tenure +       # Customer tenure in KKB
+    
+    # --- Engineered numeric predictors ---
+    t_PaymentCap +   # Ability to pay (log of declared instalment capacity)
+    z_AppCount +     # Application intensity (std. applications last 12M)
+    t_MaxLimit +     # Max CC limit (log1p)
+
+    t_FollowAmt +    # Follow-up balance (log1p)
+    t_RiskAmt +      # Consumer-loan risk (log1p)
+    t_RentIl +
+    
+    # --- Additional standardized behavioural variables ---
+    z_KKB_CC_OPEN_MAX_LIM_AMT +
+    z_KKB_CC_OPEN_CNT +
+    z_KKB_CC_ACCT_CNT +
+    z_KKB_CURR_DELQ_DAY_CNT +
+    z_KKB_NON_DELQ_ACCT_CNT +
+
+    z_KKB_CC_TOT_MONTHLY_PAYM_AMT +
+    z_KKB_MORTG_TOT_RISK_AMT +
+    z_KKB_CL_TOT_RISK_AMT +
+    
+    # --- Categorical predictors (factors) ---
+    f_Education +
+    f_EmpStatus +
+    f_City +
+    f_Tier,
+    
+    
+    # --- Interaction: education modifies age–income slope ---
+    #f_Education * z_Age, vif=1440 removed
+  
+  data = model_data_scaled
+)
+
+summary(lm_fit)
+
+```
+
+#### 6.2.1 Overall Model Utility Test
+
+```{r}
+
+
+#The goal of this test is to examine whether the predictors jointly contribute to explaining variation in log-income. We test:
+
+#- **H₀:** All slope coefficients are equal to zero  
+#- **H₁:** At least one slope coefficient is nonzero  
+
+#Below we compute the F-statistic, degrees of freedom, and p-value.
+
+# --- Overall Model Utility Test ---
+
+lm_sum <- summary(lm_fit)
+
+# Extract F-stat components
+f_stat  <- lm_sum$fstatistic[1]
+df1     <- lm_sum$fstatistic[2]
+df2     <- lm_sum$fstatistic[3]
+
+# Compute p-value
+p_value <- pf(f_stat, df1, df2, lower.tail = FALSE)
+
+# Print clean output
+cat("\n--- Overall Model Utility Test ---\n")
+cat("F(", df1, ", ", df2, ") = ", round(f_stat, 2),
+    ", p-value = ", signif(p_value, 4), "\n", sep = "")
+
+
+```
+
+The overall model utility test evaluates whether all slope coefficients are simultaneously equal to zero, implying that none of the predictors improve the explanation of log-income beyond the intercept-only baseline. The estimated statistic, F(17,820)=2.99F(17, 820) = 2.99F(17,820)=2.99, yields a p-value of 4.47×10−54.47\times10\^{-5}4.47×10−5, which is well below the 0.05 significance threshold.The overall F-test strongly rejects the null hypothesis that all slope coefficients are jointly equal to zero (p \< 0.001). This confirms that the set of predictors provides statistically significant explanatory power for log-income relative to an intercept-only model. At the same time, the moderate R² and residual diagnostics indicate that important nonlinearities and interaction effects remain, which motivates the use of transformed predictors and more flexible machine learning models in later sections.
+
+```{r}
+library(car)
+
+cat("\n--- Checking for aliased coefficients ---\n")
+ali_mat <- alias(lm_fit)$Complete
+
+if (!is.null(ali_mat)) {
+  # Hangi katsayılarda alias var?
+  ali_rows <- apply(ali_mat, 1, function(x) any(x != 0))
+  aliased_coefs <- names(ali_rows[ali_rows])
+
+  cat("Aliased coefficients detected:\n")
+  print(aliased_coefs)
+
+
+  red_formula <- as.formula(
+    paste(
+      ". ~ . -",
+      paste(aliased_coefs, collapse = " - ")
+    )
+  )
+
+  lm_fit_vif <- update(lm_fit, formula = red_formula)
+
+  cat("\n--- Variance Inflation Factors (VIF) – after removing aliased terms ---\n")
+  print(vif(lm_fit_vif))
+
+} else {
+  cat("No aliased coefficients, printing VIF for original model.\n")
+  print(vif(lm_fit))
+}
+
+```
+
+## 6.3.0 Regression Diagnostics (Assumption Checks)
+
+In this section, we verify that the assumptions of linear regression are met. These checks ensure that our model's coefficients are unbiased and that our hypothesis tests are valid.The initial Residuals vs Fitted plot shows curvature and mild heteroscedasticity, suggesting that the linearity assumption is violated. This diagnostic motivated applying predictor-side transformations (log-limit, log-utilization, √score) to better stabilize variance and improve linear fit. After transformation, the updated residual plot exhibited a more random scatter around zero, confirming improved specification
+
+#### 6.3.1Multicollinearity Check
+
+First, we check for multicollinearity to ensure that the predictor variables are not highly correlated with each other. We use the **Variance Inflation Factor (VIF)**. A VIF value exceeding 5 indicates problematic multicollinearity.
+
+```{r}
+library(car)
+
+# 1. Multicollinearity (VIF Test)
+# Check if predictors are too correlated with each other.
+# VIF > 5 indicates a potential problem.
+print("--- Variance Inflation Factors (VIF) ---")
+vif(lm_fit)
+
+```
+
+#### 6.3.2 Normality of Residuals
+
+The errors (residuals) of the model should follow a normal distribution. We visualize this using a **Q-Q Plot**. Ideally, the standardized residuals (dots) should fall along the straight blue line. Deviations from the line, especially at the tails, indicate non-normality.
+
+```{r}
+# 2. Normality of Residuals (QQ Plot)
+# Since we used log_income, this should look better than raw income.
+res_stud <- rstudent(lm_fit)
+
+qqPlot(
+  res_stud,
+  main = "QQ Plot - Regression Residuals",
+  ylab = "Studentized residuals"
+)
+```
+
+#### 6.3.3 Homoscedasticity (Constant Variance)
+
+One of the key assumptions is **Homoscedasticity**, meaning the variance of the error terms should be constant across all levels of the independent variables.
+
+We use the **Non-Constant Variance (NCV) Test** (Score Test) as a statistical check.
+
+-   **Null Hypothesis (**$H_0$): Variance is constant (Homoscedasticity).
+
+-   **Alternative Hypothesis (**$H_1$): Variance is not constant (Heteroscedasticity).
+
+If the **p-value \> 0.05**, we fail to reject the null hypothesis, which is the desired outcome.
+
+```{r}
+# Statistical Test for Homoscedasticity
+print("--- Non-Constant Variance Test (NCV) ---")
+ncvTest(lm_fit)
+```
+
+We also perform a visual check using the **Scale-Location Plot**. We look for a horizontal red line with points spread randomly around it. A sloping line would suggest heteroscedasticity.
+
+```{r}
+# Visual Check: Scale-Location Plot
+plot(lm_fit, which = 3, main = "Scale-Location Plot")
+```
+
+#### 6.3.4. Linearity and Patterns (Residuals vs Fitted)
+
+Finally, we check the **Residuals vs Fitted** plot to detect any non-linear patterns that the model failed to capture.
+
+-   **Ideal:** A random cloud of points around the horizontal zero line.
+
+-   **Problematic:** A "U" shape or distinct curve suggests that a non-linear relationship (e.g., quadratic) is missing from the model.
+
+```{r}
+
+# 4. Residuals vs Fitted (Optional Visual Check)
+# Useful to see if there are any non-linear patterns left.
+plot(lm_fit, which = 1, main = "Residuals vs Fitted")
+```
+
+```{r}
+
+# 6.3.4 Non-linearity check via Component + Residual (CR) plots
+
+
+lm_main <- lm(
+  log_income ~ 
+    # --- Age & lifecycle ---
+    z_Age + I(z_Age^2) +
+    
+    # --- Core creditworthiness predictors ---
+    z_Score +
+    z_Util +
+    z_Limit +
+    z_Asset +
+    z_Tenure +
+    
+    # --- Engineered numeric predictors ---
+    t_PaymentCap +
+    z_AppCount +
+    t_MaxLimit +
+
+    t_FollowAmt +
+    t_RiskAmt +
+    
+    # --- Additional standardized behavioural variables ---
+    z_KKB_CC_OPEN_MAX_LIM_AMT +
+    z_KKB_CC_OPEN_CNT +
+    z_KKB_CC_ACCT_CNT +
+    z_KKB_CURR_DELQ_DAY_CNT +
+    z_KKB_NON_DELQ_ACCT_CNT +
+    z_KKB_CC_TOT_MONTHLY_PAYM_AMT +
+    z_KKB_MORTG_TOT_RISK_AMT +
+    z_KKB_CL_TOT_RISK_AMT +
+    
+    # --- Categorical predictors (main effects only) ---
+    f_Education +
+    f_EmpStatus +
+    f_City +
+    f_Tier,
+  
+  data = model_data_scaled
+)
+
+car::crPlots(
+  lm_main,
+  terms = ~ z_Age + z_Score + z_Util + z_Limit,
+  main  = "Component + Residual Plots (Non-linearity Check – Main Effects Model)"
+)
+
+```
+
+## 6.4.0 Applied Transformations and Engineered Features
+
+```{r}
+
+library(tibble)
+library(knitr)
+library(kableExtra)
+
+transformation_table <- tribble(
+  ~"Feature / Variable",           ~"Transformation Type",                     ~"Rationale",                                      ~"New Feature",
+
+  # --- Target transforms ---
+  "Edevlet_Net_Gelir",             "Log transform",                            "Stabilize variance, linearize multiplicative effects", "log_income",
+  "kira_il_ortalama",              "log1p()",                                  "Reduce skewness, handle zeros",                    "t_RentIl",
+
+  # --- PR-plot nonlinear transforms ---
+  "Age",                           "Quadratic (Age²)",                         "Inverted-U partial residual pattern",              "age2",
+  "Credit Limit",                  "log(limit+1)",                             "Diminishing returns",                              "log_limit_raw",
+  "Utilization Ratio",             "log(util+ε)",                              "Exponential effect",                               "log_util_raw",
+  "KKB Score",                     "sqrt(score)",                              "Convex pattern",                                   "sqrt_score",
+
+  # --- Z-score standardization ---
+  "Age",                           "Z-score",                                   "Normalization for linear modeling",               "z_Age",
+  "Score",                         "Z-score",                                   "Standard scale",                                   "z_Score",
+  "Utilization",                   "Z-score",                                   "Reduce scale bias",                               "z_Util",
+  "Total Limit",                   "Z-score",                                   "Normalize skewed variable",                        "z_Limit",
+  "Tenure",                        "Z-score",                                   "Scale alignment",                                 "z_Tenure",
+  "Application Count",             "Z-score",                                   "Make counts comparable",                           "z_AppCount",
+
+  # --- Extra log transforms ---
+  "Payment Capacity",              "log(x+1)",                                 "Correct heavy right tail",                         "t_PaymentCap",
+  "Max Limit",                     "log1p()",                                  "Large outliers",                                   "t_MaxLimit",
+  "Follow-up Amount",              "log1p()",                                  "Zero-heavy + right tail",                          "t_FollowAmt",
+  "Risk Amount",                   "log1p()",                                  "Reduce heavy tail",                                "t_RiskAmt",
+
+  # --- Ratios ---
+  "Total Limit / Card Count",      "Ratio",                                    "Credit capacity per card",                         "avg_limit_per_card",
+  "Max Limit Share",               "Ratio",                                    "Risk concentration",                               "limit_ratio",
+  "Payment / Limit",               "Ratio",                                    "Affordability metric",                             "taksit_yuk_oran",
+
+  # --- Threshold flags ---
+  "Total Limit",                   ">50k / >100k / >200k flags",               "Credit tier segmentation",                         "t_lim_mid / t_lim_high / t_lim_vip",
+
+  # --- Interaction ---
+  "PaymentCap × Limit",            "Interaction term",                         "Joint solvency–exposure effect",                   "paycap_x_limit",
+
+  # --- Categorical grouping ---
+  "City",                          "İstanbul/Ankara/İzmir vs Other",           "Reduce cardinality, meaningful clustering",        "f_City",
+
+  # --- Factor encodings ---
+  "Education",                     "Factor encoding",                          "Categorical modeling",                             "f_Education",
+  "Employment Status",             "Factor encoding",                          "Categorical modeling",                             "f_EmpStatus",
+  "Tier",                          "Factor encoding",                          "Risk-based tier grouping",                         "f_Tier"
+)
+
+kbl(transformation_table,
+    caption = " Transformation & Feature Engineering Summary",
+    booktabs = TRUE,
+    align = "llll",
+    escape = FALSE
+) %>%
+  kable_classic(full_width = FALSE, html_font = "Arial") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    font_size = 14
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#3E5C76") %>%   # Header: navy gradient
+  column_spec(1, color = "#1A1A1A") %>%                                   # Dark text for first col
+  column_spec(2, color = "#003566") %>%                                   # Deep blue
+  column_spec(3, color = "#5F0F40") %>%                                   # Burgundy for rationale
+  column_spec(4, color = "#0A9396") %>%                                   # Teal for new feature
+  add_header_above(c(" " = 4),
+                   background = "#3E5C76",
+                   color = "white",
+                   bold = TRUE)
+
+
+```
+
+### 6.4.1 Variable Transformations (Justification)
+
+```{r}
+model_data_trans <- model_data_scaled %>%
+  mutate(
+    t_util = log(KKB_CC_UTIL_RATIO + 0.001),
+    t_limit = log(KKB_CC_OPEN_TOT_LIM_AMT + 1),
+    t_score = sqrt(KKB_SCORE),
+    age2 = z_Age^2
+  )
+
+lm_trans <- lm(
+  log_income ~ 
+    z_Age + age2 +
+    t_score + t_util + t_limit +
+    z_Tenure + f_Education + f_EmpStatus,
+  data = model_data_trans
+)
+
+summary(lm_trans)
+
+```
+
+Before estimating the optimized model, key predictors were transformed to achieve linearity, reduce skewness and stabilize variance.
+
+-   Credit card utilization (ratio) → log(x + 0.001)\
+
+-   Credit limit (heavy-tailed) → log(limit + 1)\
+
+-   KKB score (curvilinear) → √score\
+
+-   Age → quadratic term (Age²)\
+
+    These transformations were selected after visually inspecting scatterplots, component+residual (CR) plots and residual diagnostics. Each transformation improved linearity and reduced residual curvature, producing a more statistically valid model.
+
+```{r}
+plot(lm_fit, which = 1, main="Residuals vs Fitted (Before Transformation)")
+plot(lm_trans, which = 1, main="Residuals vs Fitted (After Transformation)")
+
+```
+
+## 6.5 Residuals vs Fitted Plot
+
+```{r}
+
+resid_df <- data.frame(
+  fitted    = fitted(lm_main),
+  residuals = resid(lm_main)
+)
+
+# 2. Plot residuals vs fitted with a LOESS smoother
+library(ggplot2)
+
+ggplot(resid_df, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Residuals vs Fitted Values (Main Linear Model)",
+    subtitle = "LOESS curve shows remaining non-linearity or patterns",
+    x = "Fitted Values (Predicted Log Income)",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+
+## 6.6 Component-plus-Residual (Partial Residual) Plots for key numeric predictors
+
+The magenta curve represents the smoothed LOESS fit (indicating the actual underlying relationship in the data), while the dashed blue line represents the current linear model fit. Significant deviations between the two lines in `HF_CUSTOMER_AGE` and `KKB_CC_OPEN_TOT_LIM_AMT` indicate missing non-linear terms (quadratic and logarithmic, respectively).
+
+```{r}
+library(car)
+
+# Fit a temporary base OLS model (just numeric predictors) for diagnostics
+# Ensure your model_data_scaled is clean
+diagnostic_lm <- lm(log_income ~ HF_CUSTOMER_AGE + KKB_SCORE + 
+                    KKB_CC_UTIL_RATIO + KKB_CC_OPEN_TOT_LIM_AMT + 
+                    KKB_CUST_TENURE, 
+                    data = model_data_scaled)
+
+# Plot Partial Residuals
+# Look for U-shapes (need x^2) or Log-shapes (need log(x))
+car::crPlots(diagnostic_lm, 
+             smooth = list(col = "red", lwd = 2),
+             main = "Partial Residual Plots: Checking for Non-Linearity")
+```
+
+1.  **HF_CUSTOMER_AGE (Top-Left):** The LOESS smoother (magenta line) exhibits a clear "inverted-U" shape, rising until approximately age 35-40 and then declining. The linear model (blue dashed line) fails to capture this life-cycle income peak. This provides strong statistical evidence that an **Age² (quadratic)** term is required to correctly model the income trajectory.
+
+2.  **KKB_CC_OPEN_TOT_LIM_AMT (Middle-Right):** The relationship shows a steep initial increase that rapidly flattens out (diminishing returns). The linear model incorrectly assumes a constant increase, likely overestimating income for very high-limit customers. A **Logarithmic** transformation (or removing the intercept/outliers) is necessary to linearize this saturation effect.
+
+    These plots explain the discrepancy between the LASSO and LightGBM variable importance scores observed earlier. LightGBM automatically detects these non-linear patterns (the "humps" and "curves") and assigns high importance to Age and Limit. In contrast, the standard LASSO model sees only the "flat" linear fit and underestimates their predictive power. To improve the linear model's performance, these specific non-linear transformations must be explicitly engineered.
+
+## 
+
+# 7.0 Model Optimization (Stepwise Selection)
+
+**We also included the interaction term between Education and Age (`f_Education * z_Age`) for three main reasons: (removed since vif=1440)**
+
+1.  **To Capture Different Growth Rates (Slopes):** We hypothesize that income doesn't just grow with age; the *rate* of growth depends on education. For example, a university graduate likely sees their salary increase faster over the years compared to a high school graduate.
+
+2.  **Avoid Parallel Line Assumption:** Without this interaction, the model assumes the 'experience premium' is identical for everyone (parallel regression lines). The interaction allows the slopes to differ for each education level.
+
+3.  **Better Model Fit:** This reflects real-world labor economics where higher human capital typically yields compounding returns over time, improving the model's predictive power ($R^2$).
+
+```{r}
+full_model <- lm(
+  log_income ~ 
+    z_Age + I(z_Age^2) +
+    z_Score +
+    z_Util +
+    z_Limit +
+    z_Asset +
+    z_Tenure +
+    f_Education +
+    f_EmpStatus,
+   # f_Education:z_Age,   # interaction term
+  data = model_data_scaled
+)
+
+library(MASS)
+
+optimized_model <- stepAIC(
+  full_model,
+  direction = "both",
+  trace = FALSE
+)
+
+print("--- Optimized Model Summary ---")
+summary(optimized_model)
+
+```
+
+The final stepwise-selected regression model is statistically significant (p \< 0.001) and explains a substantial share of the variation in log-income. The estimates confirm a non-linear age profile (with income increasing up to mid-career and flattening or slightly declining afterwards), a strong positive effect of credit score, and systematic differences across employment-status groups. Education and its interaction with age are less prominent once credit-bureau and banking variables are included, suggesting that much of the education effect is mediated through observed financial behaviour.
+
+**Key findings include:**
+
+1.  **Non-Linear Age Effect:** The squared age term was significant and negative ($\beta = -0.086, p < .001$), confirming an inverted U-shaped relationship where income rises with age, peaks, and then declines.
+
+2.  **Score:** The score variable had a strong positive association with income ($\beta = 0.142, p < .001$).
+
+3.  **Employment Status:** Significant disparities exist based on employment status. Compared to the reference group, 'Status 2' showed significantly higher income, while 'Status 4', '8', and '9' were associated with substantially lower income levels.
+
+4.  **Education & Interactions:** Interestingly, neither the main effects of education nor the interaction between age and education were statistically significant in this specific model structure, suggesting that the age-income trajectory remains relatively consistent across different education levels.
+
+## 7.1.1 Age–Income Trends by Education Group
+
+```{r}
+ggplot(
+  model_data_scaled,
+  aes(
+    x     = HF_CUSTOMER_AGE,
+    y     = Edevlet_Net_Gelir,
+    color = f_Education
+  )
+) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_smooth(method = "lm", se = FALSE, size = 1) +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    title    = "Age–Income Profiles by Education Level",
+    subtitle = "Non-parallel slopes illustrate the Education × Age interaction",
+    x        = "Age",
+    y        = "Income (log scale)",
+    color    = "Education"
+  ) +
+  theme_minimal()
+```
+
+## 7.1.2 2D Partial Dependence Heatmap: Age × KKB Score
+
+```{r age_score_pd, eval=FALSE}
+
+# Age & Score grid
+
+age_seq <- seq(
+from = quantile(train_data$HF_CUSTOMER_AGE, 0.05, na.rm = TRUE),
+to   = quantile(train_data$HF_CUSTOMER_AGE, 0.95, na.rm = TRUE),
+length.out = 35
+)
+
+score_seq <- seq(
+from = quantile(train_data$KKB_SCORE, 0.05, na.rm = TRUE),
+to   = quantile(train_data$KKB_SCORE, 0.95, na.rm = TRUE),
+length.out = 35
+)
+
+grid <- expand.grid(
+HF_CUSTOMER_AGE = age_seq,
+KKB_SCORE       = score_seq
+)
+
+# Repeat base profile for each combo
+
+base_rep <- base_profile[rep(1, nrow(grid)), ]
+base_rep$HF_CUSTOMER_AGE <- grid$HF_CUSTOMER_AGE
+base_rep$KKB_SCORE       <- grid$KKB_SCORE
+
+# Predictions
+
+grid_pred <- predict(best_model_fit, new_data = base_rep)$.pred
+
+heat_df <- tibble::tibble(
+Age        = grid$HF_CUSTOMER_AGE,
+KKB_Score  = grid$KKB_SCORE,
+Income_TL  = exp(grid_pred)
+)
+
+ggplot2::ggplot(heat_df,
+aes(x = Age, y = KKB_Score, fill = Income_TL)) +
+ggplot2::geom_tile() +
+ggplot2::scale_fill_continuous(labels = scales::comma) +
+ggplot2::labs(
+title    = paste("2D Partial Dependence: Age × KKB Score (", best_model_name, ")", sep = ""),
+subtitle = "Predicted income (TL) when varying age and score jointly",
+x        = "Age",
+y        = "KKB Score",
+fill     = "Predicted\nIncome (TL)"
+) +
+ggplot2::theme_minimal()
+
+```
+
+## 7.2 Significant Outliers (Bonferroni Test)
+
+Two observations are statistically significant outliers, meaning their income is vastly different from what the model predicts based on their characteristics.
+
+-   **Observation 726:** With a studentized residual of **5.55** and a Bonferroni p-value of **3.14e-05**, this is the most extreme outlier.
+
+-   **Observation 573:** With a residual of **4.70** and a significant p-value (**0.0025**), this is also a clear anomaly.
+
+```{r}
+
+## Outlier and Influence Diagnostics 
+
+library(car)
+
+cat("\n--- Bonferroni Outlier Test ---\n")
+outlier_res <- outlierTest(lm_fit)
+print(outlier_res)
+
+# Influence plot (leverage vs studentized residuals vs Cook's distance)
+influencePlot(
+  lm_fit,
+  main = "Influence Plot",
+  sub  = "Top 3 influential observations"
+)
+
+# --- Auxiliary model WITHOUT interactions for avPlots / crPlots ---
+
+# lm_fit içinde f_Education * z_Age interaction’ı var.
+# Bu interaction terimini formülden düşürüp "main-effects only" bir model kuruyoruz.
+lm_main <- update(
+  lm_fit,
+  . ~ . - f_Education:z_Age   # sadece interaction terimini siliyoruz
+)
+
+# Added-variable plots for key predictors (main-effects-only model)
+avPlots(
+  lm_main,
+  terms = ~ z_Score + z_Tenure,
+  main  = "Added-variable plots for selected predictors (main-effects model)"
+)
+
+# Component + residual plots for nonlinearity (main-effects-only model)
+crPlots(
+  lm_main,
+  terms = ~ z_Age + z_Score,
+  main  = "Component + Residual Plots (Non-linearity Check – main-effects model)"
+)
+
+
+```
+
+# 8.0 Model Evaluation
+
+```{r}
+
+actuals     <- exp(lm_fit$model$log_income)
+predictions <- exp(fitted(lm_fit))
+
+results_df <- data.frame(Actual = actuals, Predicted = predictions)
+
+ggplot(results_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.4, color = "darkblue") +
+  
+  # Add LOESS smoother
+  geom_smooth(method = "loess", se = FALSE, color = "orange", linewidth = 1.2) +
+  
+  # 45-degree perfect prediction line
+  geom_abline(
+    slope = 1, intercept = 0,
+    color = "red", linetype = "dashed", linewidth = 1
+  ) +
+  
+  scale_x_log10(labels = scales::comma) +
+  scale_y_log10(labels = scales::comma) +
+  
+  labs(
+    title = "Actual vs Predicted Income",
+    subtitle = "Orange LOESS line shows model bias; red dashed line is perfect prediction",
+    x = "Actual Income (Log Scale)",
+    y = "Predicted Income (Log Scale)"
+  ) +
+  theme_minimal()
+```
+
+## 8.1Residual Diagnostics
+
+```{r}
+# 6.X Residual Diagnostics
+library(car)
+
+# Set plotting layout with smaller margins
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+
+plot(lm_fit)   # 4 standard diagnostic plots
+
+# Reset layout
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2))
+
+# Multicollinearity
+cat("\n--- Variance Inflation Factors (VIF) ---\n")
+print(vif(lm_fit))
+
+```
+
+# 9.0 Train/Test Split
+
+We split the data into training (80%) and testing (20%) sets. The model will be trained only on the training set, and evaluated on the hold-out testing set to check for overfitting.
+
+```{r}
+# --- 9.0 Stratified Train/Test Split ---
+
+set.seed(123)
+
+# 1. Create the Split
+# We use 'model_data_scaled'. Even if it contains Edevlet_Net_Gelir,
+# we will handle it in the recipe below.
+data_split <- initial_split(model_data_scaled, prop = 0.80, strata = log_income)
+
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# 2. Define the Recipe (The Critical Part)
+ml_recipe <- recipe(log_income ~ ., data = train_data) %>%
+  
+  # PREVENT LEAKAGE 
+  # We explicitly remove the original target column (and any other leakage columns)
+  # so they are not treated as predictors.
+  step_rm(any_of(c("Edevlet_Net_Gelir", "Edevlet_Brut_Gelir", "Model_Gelir"))) %>%
+  
+  # Handle Categorical Variables
+  step_novel(all_nominal_predictors()) %>%       # Handle new categories in test data
+  step_unknown(all_nominal_predictors()) %>%     # Handle missing categories
+  step_other(all_nominal_predictors(), threshold = 0.02) %>% # Group rare categories
+  step_dummy(all_nominal_predictors()) %>%       # One-hot encoding
+  
+  # Handle Numeric Variables
+  step_zv(all_predictors()) %>%                  # Remove zero-variance columns
+  step_normalize(all_numeric_predictors())       # Standardize (Z-score)
+
+# 3. Double Check (Optional)
+# This prints the columns that will actually be used by the model.
+# Verify that 'Edevlet_Net_Gelir' is NOT in this list.
+prep_ml <- prep(ml_recipe)
+
+# 3. "Juice" extracts the transformed data so we can look at it
+design_ml <- juice(prep_ml)
+prep(ml_recipe)
+```
+
+In the machine learning recipe, we explicitly remove all e-Government income fields (`Edevlet_Net_Gelir`, `Edevlet_Brut_Gelir`) and the modelled income (`Model_Gelir`) from the predictor set. The outcome of all models is `log_income`, defined as the logarithm of `Edevlet_Net_Gelir`. This guarantees that the e-Government net income is strictly used as the response variable and never as an input feature, fully addressing potential target leakage.
+
+## 9.1 Null / Baseline Model
+
+As a baseline, we fit a null model that predicts the same value (the mean log-income in the training data) for everyone. This gives us a benchmark RMSE/MAE that any useful model should improve upon.
+
+```{r}
+null_lm <- lm(log_income ~ 1, data = train_data)
+
+test_null_pred_log <- predict(null_lm, newdata = test_data)
+y_test_log <- test_data$log_income
+
+null_rmse_log <- sqrt(mean((y_test_log - test_null_pred_log)^2))
+null_mae_log  <- mean(abs(y_test_log - test_null_pred_log))
+
+data.frame(
+  model = "Null",
+  RMSE_log = null_rmse_log,
+  MAE_log  = null_mae_log
+)
+
+```
+
+## 9.2 Model Specifications
+
+For the tree-based models (Random Forest, XGBoost, LightGBM), I did not rely on default hyperparameters. Instead, I performed a 10-fold cross-validated, space-filling hyperparameter search with 40 candidate configurations per algorithm, tuning the number of trees, maximum depth, learning rate, minimum node size, and mtry. The best configuration was selected based on cross-validated RMSE using `select_best()`, and the final models (`xgb_spec_cv`, `lgbm_spec_cv`) were refit on the full training data before being included in the model comparison leaderboard.
+
+```{r}
+tree_spec <- decision_tree(cost_complexity = 0.001) %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+
+rf_spec <- rand_forest(trees = 500, mtry = 3) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+knn_spec <- nearest_neighbor(neighbors = 5) %>%
+  set_engine("kknn") %>%
+  set_mode("regression")
+
+lasso_spec <- linear_reg(penalty = 0.01, mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+lasso_spec_cv <- lasso_spec  # this creates the object
+
+xgb_spec <- boost_tree(
+  trees = 1000, 
+  tree_depth = 6, 
+  min_n = 5, 
+  loss_reduction = 0.001,                     
+  sample_size = 0.5, 
+  mtry = 2,         
+  learn_rate = 0.01                         
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+# B. LightGBM (Faster & Efficient Boosting)
+lgbm_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = 6,
+  learn_rate = 0.01
+) %>%
+  set_engine("lightgbm") %>%
+  set_mode("regression")
+
+```
+
+## 9.3 Model Comparison via 10-Fold Cross-Validation
+
+```{r}
+
+# 1. Create 10-Fold Cross-Validation Folds
+# As suggested in "Tidy Modeling with R" (Chapters 10 & 12),
+# we use 10 folds to ensure a robust estimate of performance.
+set.seed(42)
+cv_folds <- vfold_cv(
+  train_data, 
+  v = 10,                 # Changed to 10-fold as per standard literature
+  strata = log_income     # Stratified sampling to keep income distribution balanced
+)
+fit_and_eval_cv <- function(model_spec, model_name) {
+  
+  wf <- workflow() %>%
+    add_recipe(ml_recipe) %>%
+    add_model(model_spec)
+  
+  res <- fit_resamples(
+    wf,
+    resamples = cv_folds,
+    metrics   = metric_set(rmse, mae, rsq),
+    control   = control_resamples(save_pred = FALSE, verbose = FALSE)
+  )
+  
+  metrics_avg <- collect_metrics(res)
+  
+  final_fit <- fit(wf, data = train_data)
+  
+  tibble(
+    Model   = model_name,
+    CV_RMSE = metrics_avg %>% filter(.metric == "rmse") %>% pull(mean),
+    CV_MAE  = metrics_avg %>% filter(.metric == "mae") %>% pull(mean),
+    CV_R2   = metrics_avg %>% filter(.metric == "rsq") %>% pull(mean),
+    fit     = list(final_fit)
+  )
+}
+
+
+print("Running 10-Fold Cross-Validation (this may take a moment)...")
+# 1) Classical models
+res_tree   <- fit_and_eval_cv(tree_spec,       "Decision Tree")
+res_rf     <- fit_and_eval_cv(rf_spec,         "Random Forest")
+res_knn    <- fit_and_eval_cv(knn_spec,        "k-NN")
+
+# 2) LASSO (already tuned)
+res_lasso  <- fit_and_eval_cv(lasso_spec_cv,   "LASSO Regression")
+
+res_xgb    <- fit_and_eval_cv(xgb_spec,    "XGBoost")
+res_lgbm   <- fit_and_eval_cv(lgbm_spec,   "LightGBM")
+
+# Combine results
+final_comparison <- bind_rows(
+  res_tree, res_rf, res_knn, res_lasso, res_xgb, res_lgbm
+) %>%
+  arrange(CV_RMSE)
+
+print("--- Cross-Validation Results ---")
+print(final_comparison)
+
+
+
+```
+
+## 9.4 Test-set Performance of the Best Model
+
+```{r}
+# --- 9.4 Test-set Performance of the Best Model ---
+
+# 1. Automatically Select the Best Model (Lowest RMSE)
+
+best_model_row <- final_comparison %>% 
+  arrange(CV_RMSE) %>%
+  slice(1)
+best_model_name <- best_model_row$Model
+best_model_fit  <- best_model_row$fit[[1]]
+
+print(paste("🏆 The Best Performing Model is:", best_model_name))
+
+# 2. Generate Predictions on Test Data
+# 'best_model_fit' is a workflow object, so we can predict directly
+test_predictions <- predict(best_model_fit, new_data = test_data) %>%
+  bind_cols(test_data) %>%
+  rename(predicted_log_income = .pred) %>%
+  mutate(
+    # Back-transform from Log scale to original TL scale
+    actual_tl = exp(log_income),
+    predicted_tl = exp(predicted_log_income)
+  )
+
+# 3. Calculate Real-World Metrics (TL Basis)
+rmse_tl <- sqrt(mean((test_predictions$actual_tl - test_predictions$predicted_tl)^2))
+mae_tl  <- mean(abs(test_predictions$actual_tl - test_predictions$predicted_tl))
+r2_test <- cor(test_predictions$actual_tl, test_predictions$predicted_tl)^2
+
+# Create a summary table
+performance_metrics <- data.frame(
+  Model   = best_model_name,
+  RMSE_TL = rmse_tl,
+  MAE_TL  = mae_tl,
+  R2_Test = r2_test
+)
+
+print("--- Test Set Performance Metrics (Original Scale) ---")
+print(performance_metrics)
+
+# 4. Actual vs Predicted Plot (Log Scale)
+ggplot(test_predictions, aes(x = log_income, y = predicted_log_income)) +
+  geom_point(alpha = 0.4, color = "darkgreen") +
+  geom_abline(lty = 2, color = "red", linewidth = 1) +
+  labs(
+    title = paste("Best Model:", best_model_name, "- Actual vs. Predicted"),
+    subtitle = "The red dashed line indicates perfect prediction accuracy.",
+    x = "Actual Log Income",
+    y = "Predicted Log Income"
+  ) +
+  theme_minimal()
+```
+
+On the hold-out test set, the best-performing model (as selected by 10-fold cross-validation) achieves materially lower RMSE and MAE compared to the null benchmark that predicts the same mean income for all customers. The test-set R² indicates that the model generalizes reasonably well beyond the training data. Nonetheless, the error distribution and segment-wise analysis show that performance is heterogeneous across employment-status and education groups, pointing to potential gains from segment-specific models or further feature engineering.
+
+```{r}
+rmse_tl <- rmse_vec(results_df$Actual, results_df$Predicted)
+mae_tl  <- mae_vec(results_df$Actual, results_df$Predicted)
+
+sst <- sum( (results_df$Actual - mean(results_df$Actual))^2 )
+sse <- sum( (results_df$Actual - results_df$Predicted)^2 )
+r2_test <- 1 - sse/sst
+
+data.frame(
+  Model   = "XGBoost (test set)",
+  RMSE_TL = rmse_tl,
+  MAE_TL  = mae_tl,
+  R2_test = r2_test
+)
+
+```
+
+```{r}
+
+test_results <- test_data %>%
+  bind_cols(predict(best_model_fit, new_data = test_data)) %>%
+  rename(predicted_log_income = .pred)
+
+ggplot(test_results, aes(x = log_income, y = predicted_log_income)) +
+  geom_point(alpha = 0.35, color = "darkgreen") +
+  
+  # ---- Added LOESS smoother ----
+  geom_smooth(method = "loess", se = FALSE, color = "steelblue", size = 1.1) +
+  
+  # Identity line
+  geom_abline(lty = 2, color = "red", linewidth = 1) +
+  
+  labs(
+    title = paste(best_model_name, "Performance: Actual vs Predicted (Log Scale)"),
+    subtitle = "LOESS smoother (blue) shows systematic deviations from the ideal red line",
+    x = "Actual Log Income",
+    y = "Predicted Log Income"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
+## 9.5 Residual Analysis & Feature Importance
+
+```{r}
+# 1. Residual Plot
+test_predictions <- test_predictions %>%
+  mutate(residuals = log_income - predicted_log_income)
+
+ggplot(test_predictions, aes(x = predicted_log_income, y = residuals))  +
+  geom_point(alpha = 0.35, color = "#006D77") +   # teal-ish modern color
+  geom_smooth(method = "loess", se = FALSE, color = "#FF8C42", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.8) +
+  labs(
+    title = paste("Residual Plot (", best_model_name, ")", sep = ""),
+    subtitle = "LOESS smoother highlights any systematic bias around 0.",
+    x = "Predicted Log Income",
+    y = "Residuals (Error)"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r}
+# --- 1. Generate predictions for LightGBM ---
+lgbm_results <- test_data %>%
+  bind_cols(predict(best_model_fit, new_data = test_data)) %>%
+  rename(predicted_log_income = .pred)
+
+# --- 2. Compute residuals ---
+lgbm_results <- lgbm_results %>%
+  mutate(residuals = log_income - predicted_log_income)
+
+# --- 3. Residual Plot for LightGBM ---
+ggplot(lgbm_results, aes(x = predicted_log_income, y = residuals)) +
+  geom_point(alpha = 0.35, color = "#006D77") +   # teal-ish modern color
+  geom_smooth(method = "loess", se = FALSE, color = "#FF8C42", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.8) +
+  labs(
+    title = paste("Residual Plot –", best_model_name, "(LightGBM)"),
+    subtitle = "LOESS smoother (orange) shows non-linear bias patterns in tree-based model.",
+    x = "Predicted Log Income",
+    y = "Residuals (Actual – Predicted)"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+### 9.5.2 Residual Plot for LASSO
+
+```{r}
+# --- 1. Generate predictions for LASSO ---
+lasso_results <- test_data %>%
+  bind_cols(predict(lasso_fit, new_data = test_data)) %>% 
+  rename(predicted_log_income = .pred)
+
+# --- 2. Compute residuals ---
+lasso_results <- lasso_results %>%
+  mutate(residuals = log_income - predicted_log_income)
+
+# --- 3. Residual Plot for LASSO ---
+ggplot(lasso_results, aes(x = predicted_log_income, y = residuals)) +
+  geom_point(alpha = 0.35, color = "#4B3F72") +    # soft purple for LASSO
+  geom_smooth(method = "loess", se = FALSE, color = "#E58F65", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.8) +
+  labs(
+    title = "Residual Plot – LASSO Model",
+    subtitle = "LOESS smoother highlights linear-model bias patterns.",
+    x = "Predicted Log Income",
+    y = "Residuals (Actual – Predicted)"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+## 9.6 LightGBM VIP
+
+The LightGBM model attributes a disproportionately large share of predictive gain to “HF_Odeyebilecegi_Taksit_Tutari”, indicating that installment-paying capacity is the single most informative feature for income estimation. This behavior is expected in tree ensembles when a variable closely correlates with the target.
+
+```{r}
+
+# --- Extract fitted LightGBM engine from the final workflow ---
+
+library(tidymodels)
+library(vip)
+
+
+
+lgbm_engine <- extract_fit_parsnip(best_model_fit)$fit
+
+
+
+# Quick sanity check
+lgbm_engine
+
+# --- 2.1 Default VIP for LightGBM (gain-based) ---
+
+vip(
+  lgbm_engine,
+  num_features = 20,        # number of top variables to display
+  geom = "col",
+  aesthetics = list(width = 0.7)
+) +
+  labs(
+    title = "Variable Importance (LightGBM)",
+    subtitle = "Default model-based importance (e.g., gain / split frequency)",
+    x = "Variable",
+    y = "Importance Score"
+  ) +
+  theme_minimal()
+
+```
+
+The initial VIP plot uses LightGBM’s native importance scores, which are calculated from how much each feature improves the model’s loss function when used in tree splits (from gain). These scores describe the feature’s role inside the model structure.
+
+The permutation-based importance, on the other hand, is fully evaluates how much the model’s predictive performance decreases when the values of one feature are randomly shuffled. Because this breaks the relationship between that feature and the target, the resulting performance drop directly reflects how much the model depends on that feature for accurate predictions.
+
+In essence: model-based importance explains LightGBM’s internal decision-making, while permutation importance measures real-world predictive reliance.
+
+### 9.6.2 Permutation-Based variable importance for the LightGBM model
+
+```{r}
+
+
+# 1) Bake the training data with the same recipe used in the model
+#    This applies all preprocessing: dummies, scaling, etc.
+train_processed <- bake(prep_ml, new_data = train_data)
+
+# Sanity check
+glimpse(train_processed)
+library(vip)
+
+set.seed(123)
+
+# Permutation-based variable importance for LightGBM
+vip_lgbm_perm <- vip(
+  object  = lgbm_engine,        # the fitted LightGBM engine
+  method  = "permute",          # permutation importance
+  train   = train_processed,    # preprocessed train data (includes log_income)
+  target  = "log_income",       # outcome column name
+  metric  = "rmse",             # we measure increase in RMSE
+  nsim    = 5,                  # repeat permutations for stability
+  pred_wrapper = function(model, newdata) {
+    # newdata comes WITHOUT the target column, only predictors
+    x_mat <- as.matrix(newdata)
+    as.numeric(predict(model, newdata = x_mat))
+  },
+  num_features = 20             # top 20 variables
+) +
+  labs(
+    title    = "Permutation Importance (LightGBM)",
+    subtitle = "Increase in RMSE when each predictor is randomly permuted",
+    y        = "Increase in RMSE",
+    x        = "Variable"
+  ) +
+  theme_minimal()
+
+vip_lgbm_perm
+
+
+
+```
+
+```{r}
+# Load necessary libraries
+library(vip)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+# 1. PREPARE THE DATA
+# We need to "bake" the training data to ensure all dummy variables and 
+# normalizations are applied before calculating permutation importance.
+train_processed <- bake(prep_ml, new_data = train_data)
+
+# 2. EXTRACT MODELS AND CALCULATE IMPORTANCE
+# We use vi() instead of vip() here. vi() returns a dataframe (tibble),
+# which is perfect for custom plotting. vip() returns a plot object.
+
+# --- A. LightGBM Importance ---
+# Extract the underlying engine
+lgbm_fit_obj <- extract_fit_parsnip(res_lgbm$fit[[1]])
+
+imp_lgbm <- vi(
+  object = lgbm_fit_obj,
+  method = "permute",
+  train  = train_processed,
+  target = "log_income",
+  metric = "rmse",
+  pred_wrapper = function(object, newdata) {
+    predict(object, new_data = newdata) %>% pull(.pred)
+  },
+  nsim = 5  # Higher nsim = more stable results
+)
+
+# --- B. XGBoost Importance ---
+# Extract the underlying engine
+xgb_fit_obj <- extract_fit_parsnip(res_xgb$fit[[1]])
+
+imp_xgb <- vi(
+  object = xgb_fit_obj,
+  method = "permute",
+  train  = train_processed,
+  target = "log_income",
+  metric = "rmse",
+  pred_wrapper = function(object, newdata) {
+    predict(object, new_data = newdata) %>% pull(.pred)
+  },
+  nsim = 5
+)
+
+# --- C. Random Forest Importance ---
+# Extract the underlying engine
+rf_fit_obj <- extract_fit_parsnip(res_rf$fit[[1]])
+
+imp_rf <- vi(
+  object = rf_fit_obj,
+  method = "permute",
+  train  = train_processed,
+  target = "log_income",
+  metric = "rmse",
+  pred_wrapper = function(object, newdata) {
+    predict(object, new_data = newdata) %>% pull(.pred)
+  },
+  nsim = 1 # RF is slower, 1 sim is usually acceptable for quick checks
+)
+
+# 3. DEFINE PLOTTING FUNCTION
+# This function creates a colorful, sorted bar chart.
+plot_perm_importance <- function(imp_df, 
+                                 model_name = "Model", 
+                                 top_n = 20) {
+  
+  # Prepare data: Rename column, filter top N, reorder factor
+  plot_data <- imp_df %>%
+    rename(IncRMSE = Importance) %>%
+    arrange(desc(IncRMSE)) %>%
+    slice_head(n = top_n) %>%
+    mutate(Variable = fct_reorder(Variable, IncRMSE))
+  
+  # Generate Plot
+  ggplot(plot_data, aes(x = Variable, y = IncRMSE, fill = IncRMSE)) +
+    geom_col(show.legend = TRUE) +
+    coord_flip() +
+    
+    # Use 'plasma' or 'viridis' for a professional, colorful look
+    scale_fill_viridis_c(option = "plasma", name = "RMSE Increase") + 
+    
+    labs(
+      title    = paste("Permutation Importance (", model_name, ")", sep = ""),
+      subtitle = "Increase in RMSE when predictor is permuted (shuffled)",
+      x        = NULL, # Hide "Variable" label as it's obvious
+      y        = "Increase in RMSE"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title      = element_text(face = "bold"),
+      panel.grid.major.y = element_blank(), # Cleaner look
+      axis.text.y     = element_text(size = 10)
+    )
+}
+
+# 4. GENERATE PLOTS
+# Now that imp_xgb, imp_lgbm, and imp_rf exist, these will work.
+
+# Plot XGBoost
+plot_perm_importance(imp_xgb, model_name = "XGBoost", top_n = 15)
+
+# Plot LightGBM
+plot_perm_importance(imp_lgbm, model_name = "LightGBM", top_n = 15)
+
+# Plot Random Forest
+plot_perm_importance(imp_rf, model_name = "Random Forest", top_n = 15)
+```
+
+![]()
+
+## ![](images/clipboard-1951328910.png)9.7 Age Effect Analysis (Partial Dependence)
+
+```{r}
+
+
+# 0. Pick the LightGBM workflow explicitly (NOT the best_model_fit)
+lgbm_fit <- res_lgbm$fit[[1]]
+
+# 1. Build a "typical customer" profile from the training data
+#    - numeric vars: mean
+#    - factor vars: most frequent level
+
+most_common <- function(x) names(sort(table(x), decreasing = TRUE))[1]
+
+num_profile <- train_data %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)))
+
+most_common <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+
+cat_profile <- train_data %>%
+  summarise(
+    across(
+      where(~ is.factor(.x) || is.character(.x)),
+      ~ most_common(.x)
+    )
+  )
+
+base_profile <- bind_cols(num_profile, cat_profile)
+
+# 2. Create an age grid over the observed range
+age_grid <- data.frame(
+  HF_CUSTOMER_AGE = seq(
+    from = min(train_data$HF_CUSTOMER_AGE, na.rm = TRUE),
+    to   = max(train_data$HF_CUSTOMER_AGE, na.rm = TRUE),
+    length.out = 50
+  )
+)
+
+# 3. Repeat the base profile for each age value and replace age
+newdata_age <- base_profile[rep(1, nrow(age_grid)), ]
+newdata_age$HF_CUSTOMER_AGE <- age_grid$HF_CUSTOMER_AGE
+
+# Make sure columns match training data
+common_cols <- intersect(names(train_data), names(newdata_age))
+newdata_age <- newdata_age[, common_cols]
+
+# 4. Predict with LightGBM workflow (explicitly)
+age_pred <- predict(lgbm_fit, new_data = newdata_age) %>%
+  bind_cols(age = newdata_age$HF_CUSTOMER_AGE) %>%
+  rename(predicted_log_income = .pred) %>%
+  mutate(
+    predicted_income_tl = exp(predicted_log_income)  # optional, TL scale
+  )
+
+# 5. Find the age with maximum predicted income (on log scale)
+peak_age <- age_pred %>%
+  filter(predicted_log_income == max(predicted_log_income)) %>%
+  slice(1)
+
+# 6. Plot Age vs Predicted Log-Income (with peak age marked)
+ggplot(age_pred, aes(x = age, y = predicted_log_income)) +
+  geom_line(color = "darkblue", linewidth = 1.2) +
+  geom_smooth(method = "loess", se = FALSE,
+              color = "orange", linetype = "dashed") +
+  
+  # Peak point
+  geom_point(data = peak_age,
+             aes(x = age, y = predicted_log_income),
+             color = "red", size = 3) +
+  
+  # Peak label (NOKTANIN ALTINDA)
+  geom_text(
+    data = peak_age,
+    aes(
+      x = age,
+      y = predicted_log_income,    # temel nokta
+      label = paste0("Peak age ≈ ", round(age, 0))
+    ),
+    nudge_y = -0.01,               # biraz aşağı kaydır
+    color = "red",
+    size = 4,
+    fontface = "bold"
+  ) +
+  
+  labs(
+    title    = "Age Effect on Predicted Income (LightGBM)",
+    subtitle = "Prediction from LightGBM while holding all other features fixed at typical values",
+    x        = "Age",
+    y        = "Predicted Log-Income"
+  ) +
+  theme_minimal()
+
+```
+
+This partial dependence plot illustrates how the LightGBM model responds to changes in age while all other features are held at typical values. The resulting curve is not smooth or monotonic; instead, it displays several abrupt dips and jumps. This behaviour is characteristic of tree-based models such as LightGBM, which partition the feature space into discrete regions rather than fitting a continuous function.
+
+The partial dependence plot indicates that the LightGBM model produces a highly non-smooth, piecewise relationship between age and predicted income. These discontinuities are artefacts of the tree-based structure of LightGBM rather than meaningful economic patterns. Overall, the plot reflects model-driven splits rather than a smooth life-cycle income trajectory, and the age effect should therefore be interpreted cautiously
+
+## 9.8 Error Distribution Comparison: Null vs Best Model (TL scale)Model Leaderboard Plot
+
+```{r}
+
+# 1) Best model predictions on test set (log & TL)
+
+best_model_fit <- best_model_row$fit[[1]]  # already created above
+
+pred_best_log <- predict(best_model_fit, new_data = test_data)$.pred
+actual_log    <- test_data$log_income
+
+actual_tl     <- exp(actual_log)
+pred_best_tl  <- exp(pred_best_log)
+
+# 2) Null model predictions (mean-only benchmark)
+
+pred_null_log <- predict(null_lm, newdata = test_data)
+pred_null_tl  <- exp(pred_null_log)
+
+# 3) Absolute errors in TL
+
+error_df <- dplyr::bind_rows(
+tibble::tibble(
+Model      = "Null (mean-only)",
+Abs_Error  = abs(actual_tl - pred_null_tl)
+),
+tibble::tibble(
+Model      = best_model_name,
+Abs_Error  = abs(actual_tl - pred_best_tl)
+)
+)
+
+# 4) Boxplot on log-scale (TL)
+
+ggplot2::ggplot(error_df, aes(x = Model, y = Abs_Error)) +
+ggplot2::geom_boxplot(fill = "steelblue", alpha = 0.7) +
+ggplot2::scale_y_log10(labels = scales::comma) +
+ggplot2::labs(
+title    = "Absolute Error Distribution (Test Set, TL Scale)",
+subtitle = "Comparison of best model vs null (mean-only) benchmark",
+x        = "",
+y        = "Absolute Error (log10 TL)"
+) +
+ggplot2::theme_minimal()
+
+```
+
+```{r}
+
+ggplot2::ggplot(error_df, aes(x = Abs_Error, fill = Model)) +
+ggplot2::geom_density(alpha = 0.4) +
+ggplot2::scale_x_log10(labels = scales::comma) +
+ggplot2::labs(
+title    = "Error Density – Best Model vs Null",
+x        = "Absolute Error (log10 TL)",
+y        = "Density"
+) +
+ggplot2::theme_minimal()
+
+```
+
+```{r}
+# ---  Visualizing Errors for All Models ---
+
+# 1. Create a named list of your candidate model specifications
+# (Ensure these spec objects exist from your previous steps)
+candidates <- list(
+  "XGBoost"      = xgb_spec,
+  "LightGBM"     = lgbm_spec,
+  "Random Forest"= rf_spec,
+  "LASSO"        = lasso_spec,
+  "Decision Tree"= tree_spec
+)
+
+# 2. Loop through candidates: Fit on Train -> Predict on Test -> Calculate Error
+all_errors_list <- list()
+
+# Calculate actual values once
+actual_values <- exp(test_data$log_income)
+
+for (model_name in names(candidates)) {
+  
+  # Create a temporary workflow
+  tmp_wf <- workflow() %>%
+    add_recipe(ml_recipe) %>%
+    add_model(candidates[[model_name]])
+  
+  # Fit on full training data
+  tmp_fit <- fit(tmp_wf, data = train_data)
+  
+  # Predict on test data
+  preds_log <- predict(tmp_fit, new_data = test_data)$.pred
+  
+  # Calculate Absolute Error in TL
+  preds_tl <- exp(preds_log)
+  abs_error <- abs(actual_values - preds_tl)
+  
+  # Save to list
+  all_errors_list[[model_name]] <- data.frame(
+    Model = model_name,
+    Abs_Error = abs_error
+  )
+}
+
+# 3. Don't forget the Null Model (Baseline)
+null_preds <- exp(predict(null_lm, newdata = test_data))
+all_errors_list[["Null Model"]] <- data.frame(
+  Model = "Null Model",
+  Abs_Error = abs(actual_values - null_preds)
+)
+
+# 4. Combine into one dataframe
+all_models_errors <- bind_rows(all_errors_list)
+
+# --- PLOT 1: Density Plot (All Together) ---
+ggplot(all_models_errors, aes(x = Abs_Error, fill = Model)) +
+  geom_density(alpha = 0.3, size = 0.2) + # Low alpha to see overlaps
+  scale_x_log10(labels = scales::comma) +
+  labs(
+    title    = "Error Density Comparison (All Models)",
+    subtitle = "Left-shifted curves = Higher Accuracy (Lower Errors)",
+    x        = "Absolute Error (TL) - Log Scale",
+    y        = "Density"
+  ) +
+  theme_minimal()
+
+# --- PLOT 2: Boxplot (Easier to Rank) ---
+# Reorder models by Median Error so the best is at the top
+ggplot(all_models_errors, aes(x = reorder(Model, Abs_Error, FUN = median), y = Abs_Error, fill = Model)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.5, outlier.alpha = 0.3) +
+  scale_y_log10(labels = scales::comma) +
+  coord_flip() + # Flip to make labels readable
+  labs(
+    title    = "Model Ranking by Error Distribution",
+    subtitle = "Lower position = Better Performance (Lower Median Error)",
+    x        = "",
+    y        = "Absolute Error (TL) - Log Scale"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+
+
+calib_df <- tibble::tibble(
+actual_tl = actual_tl,
+pred_tl   = pred_best_tl
+) %>%
+dplyr::mutate(
+decile = dplyr::ntile(pred_tl, 10)
+) %>%
+dplyr::group_by(decile) %>%
+dplyr::summarise(
+mean_pred   = mean(pred_tl, na.rm = TRUE),
+mean_actual = mean(actual_tl, na.rm = TRUE),
+.groups = "drop"
+)
+
+# Long format for side-by-side bars
+
+calib_long <- calib_df %>%
+tidyr::pivot_longer(
+cols      = c(mean_pred, mean_actual),
+names_to  = "type",
+values_to = "value"
+) %>%
+dplyr::mutate(
+type = dplyr::recode(type,
+"mean_pred"   = "Predicted",
+"mean_actual" = "Actual")
+)
+
+ggplot2::ggplot(calib_long,
+aes(x = factor(decile),
+y = value,
+fill = type)) +
+ggplot2::geom_col(position = "dodge") +
+ggplot2::scale_y_continuous(labels = scales::comma) +
+ggplot2::labs(
+title    = paste("Calibration Plot by Prediction Decile (", best_model_name, ")", sep = ""),
+subtitle = "Within each decile of predicted income, compare mean predicted vs actual income",
+x        = "Prediction Decile (1 = Lowest, 10 = Highest)",
+y        = "Average Income (TL)",
+fill     = ""
+) +
+ggplot2::theme_minimal()
+
+```
+
+## 9.9 Model Leaderboard Plot
+
+```{r}
+
+
+final_comparison %>%
+  mutate(Model = reorder(Model, CV_RMSE)) %>%
+  ggplot(aes(x = Model, y = CV_RMSE)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Model Leaderboard (10-fold CV, log-income scale)",
+    subtitle = "Lower CV_RMSE indicates better predictive performance",
+    x = "Model",
+    y = "CV RMSE (log-income)"
+  ) +
+  theme_minimal()
+
+
+```
+
+## 9.10 Segment-wise Error Analysis (Employment Status & Education)
+
+```{r}
+
+
+segment_errors <- test_predictions %>%
+  mutate(
+    abs_error_tl = abs(actual_tl - predicted_tl)
+  )
+
+# a) Employment status
+ggplot(segment_errors,
+       aes(x = f_EmpStatus, y = abs_error_tl)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    title = paste("Absolute Error by Employment Status (", best_model_name, ")", sep = ""),
+    x     = "Employment Status",
+    y     = "Absolute Error (log10 TL)"
+  ) +
+  theme_minimal()
+
+# b) Education
+ggplot(segment_errors,
+       aes(x = f_Education, y = abs_error_tl)) +
+  geom_boxplot(fill = "darkorange", alpha = 0.7) +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    title = paste("Absolute Error by Education Level (", best_model_name, ")", sep = ""),
+    x     = "Education Level",
+    y     = "Absolute Error (log10 TL)"
+  ) +
+  theme_minimal()
+
+```
+
+Error dispersion is higher for certain employment statuses and education groups, indicating that model performance is not fully homogeneous across segments. These groups are natural candidates for targeted model refinement or segment-specific models.
+
+## 9.11 Absolute Error vs Actual Income
+
+```{r}
+
+error_vs_income <- test_predictions %>%
+  mutate(
+    abs_error_tl = abs(actual_tl - predicted_tl)
+  )
+
+ggplot(error_vs_income,
+       aes(x = actual_tl, y = abs_error_tl)) +
+  geom_point(alpha = 0.4, color = "purple") +
+  scale_x_log10(labels = scales::comma) +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    title = paste("Absolute Error vs Actual Income (", best_model_name, ")", sep = ""),
+    subtitle = "Checks whether higher-income customers systematically exhibit larger errors",
+    x     = "Actual Income (log10 TL)",
+    y     = "Absolute Error (log10 TL)"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+# 10.1 LASSO Hyperparameter Tuning
+
+```{r}
+# 1. Define a tunable specification
+lasso_tune_spec <- linear_reg(
+  penalty = tune(), 
+  mixture = 1         
+) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("regression")
+
+# 2. Create a grid of 50 possible lambda values
+lambda_grid <- grid_regular(penalty(range = c(-5, -1)), levels = 50)
+
+# 3. Create workflow
+lasso_tune_wf <- workflow() %>%
+  add_recipe(lasso_rec) %>%       
+  add_model(lasso_tune_spec)
+
+# 4. Run Tuning (using the existing cv_folds from Step 9.3)
+doParallel::registerDoParallel() # Optional: Speed up if you have multiple cores
+
+lasso_grid_results <- tune_grid(
+  lasso_tune_wf,
+  resamples = cv_folds,
+  grid      = lambda_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+
+# 5. Visualize the Tuning Results
+lasso_grid_results %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  ggplot(aes(x = penalty, y = mean)) +
+  geom_line(size = 1, color = "steelblue") +
+  geom_point(color = "darkblue") +
+  scale_x_log10() +
+  labs(
+    title = "LASSO Tuning: RMSE vs. Penalty (Lambda)",
+    subtitle = "Finding the 'Sweet Spot' where error is minimized",
+    x = "Penalty (Lambda) - Log Scale",
+    y = "Mean RMSE (Cross-Validation)"
+  ) +
+  theme_minimal()
+```
+
+Coefficient path plot shows that only a limited subset of predictors remains non-zero as λ increases. This indicates that the dataset contains many weak or redundant variables, and LASSO effectively shrinks them toward zero, retaining only a small set of strong predictors.
+
+## 10.2 LASSO Trace Plot (Variable Selection Path)
+
+Optimal λ is very small, meaning strong regularization hurts performance in this dataset. The model needs many predictors to preserve accuracy, and aggressive shrinkage causes underfitting.
+
+```{r}
+
+
+lasso_prep <- prep(lasso_rec, training = model_data_scaled)
+design_lasso <- juice(lasso_prep)
+
+# 2) X ve y'yi oluştur
+X_train_mat <- as.matrix(dplyr::select(design_lasso, -log_income))
+y_train_vec <- design_lasso$log_income
+# 1) Extract full coefficient matrix from glmnet
+glmnet_fit <- glmnet(X_train_mat, y_train_vec, alpha = 1)
+coef_full <- as.matrix(glmnet_fit$beta)
+
+# 2) Identify variables that are ever non-zero across the lambda path
+nonzero_rows <- rowSums(abs(coef_full) > 0) > 0
+
+coef_nonzero <- coef_full[nonzero_rows, , drop = FALSE]
+
+# 3) Rank variables by maximum absolute coefficient size
+row_max <- apply(abs(coef_nonzero), 1, max)
+top_idx <- order(row_max, decreasing = TRUE)
+
+# Select the top 15 (or fewer if less exist)
+k <- min(15, length(top_idx))
+coef_mat <- coef_nonzero[top_idx[1:k], , drop = FALSE]
+
+# 4) Plot coefficient paths clearly
+matplot(
+  x    = -log(glmnet_fit$lambda),
+  y    = t(coef_mat),
+  type = "l",
+  lty  = 1,
+  lwd  = 2,
+  col  = rainbow(nrow(coef_mat)),
+  xlab = "-Log(lambda)",
+  ylab = "Coefficient",
+  main = "LASSO Coefficient Paths – Top Variables Only"
+)
+
+legend(
+  "topleft",
+  legend = rownames(coef_mat),
+  col    = rainbow(nrow(coef_mat)),
+  lty    = 1,
+  cex    = 0.65,
+  bty    = "n"
+)
+
+
+```
+
+**Figure displays the LASSO coefficient paths for the most influential predictors in the model.** Each colored line represents how a variable’s coefficient changes as the regularization penalty λ increases (moving right on the x-axis). As λ becomes larger, LASSO shrinks most coefficients toward zero, while only a small subset of predictors maintain non-zero values.
+
+The variables that remain active over a wide range of λ particularly several education dummies, employment-status categories, credit tenure, credit score, and age-group indicators—are the predictors with the strongest and most stable association with log-income.This pattern shows that LASSO actively performs variable selection: weak or redundant predictors rapidly collapse to zero, whereas high-signal predictors persist. The resulting model is therefore more interpretable and robust, retaining only the variables that meaningfully contribute to income prediction.
+
+## 10.3 Select Best vs. Simplest (1-SE Rule)
+
+```{r}
+
+
+# Get the absolute best lambda
+best_rmse <- select_best(lasso_grid_results, metric = "rmse")
+
+# Get the simplest lambda within 1 standard error of the best
+best_1se  <- select_by_one_std_err(lasso_grid_results, metric = "rmse", desc(penalty))
+
+print(paste("Best Lambda (Lowest Error):", round(best_rmse$penalty, 5)))
+print(paste("1-SE Lambda (Simplest Model):", round(best_1se$penalty, 5)))
+
+# Update workflow with the Best Lambda and finalize
+final_lasso_wf <- finalize_workflow(lasso_tune_wf, best_rmse)
+final_lasso_fit <- fit(final_lasso_wf, data = train_data)
+
+# Extract and plot the coefficients of the OPTIMIZED model
+final_lasso_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 20, geom = "point",
+      aesthetics = list(color = "darkred", size = 3)) +
+  labs(
+    title = "Variable Importance (Optimized LASSO)",
+    subtitle = "t_PaymentCap = log(HF_Odeyebilecegi_Taksit_Tutari + 1):\nA log-transformed payment capacity measure capturing non-linear effects",
+    x = "Importance",
+    y = NULL
+  ) +
+  theme_minimal()
+
+
+```
+
+**Figure "Variable Importance (Optimized LASSO)"** presents the same information in a more interpretable way using a variable-importance representation. Instead of plotting the raw β’s, the `vip` function ranks predictors by the absolute size of their standardized coefficients and omits the intercept. Education-related dummies, employment-status categories, credit-tenure, and credit score emerge as the most influential drivers of log-income. This plot therefore highlights which variables matter most for prediction, while the coefficient plot shows how (positive/negative) they affect income.
+
+**Figure "Coefficient Magnitudes at Optimal λ"** reports the raw coefficient estimates of the optimized LASSO model. The intercept is close to 10, reflecting the average log-income in the sample, while all slope coefficients are much smaller in magnitude. Coefficients to the right of zero indicate variables that increase predicted income, whereas negative coefficients reduce it.
+
+The heatmap shows how variable coefficients evolve along the LASSO path, with only a few predictors remaining active under strong regularization, confirming their robustness and predictive relevance.
+
+```{r lasso-coef-ggplot, message=FALSE, warning=FALSE, fig.width=15, fig.height=12}
+
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+
+# 1. Extract glmnet model
+glmnet_model <- extract_fit_parsnip(final_lasso_fit)$fit
+
+# 2. Coefficients at optimal lambda (best_rmse$penalty)
+coef_mat <- coef(glmnet_model, s = best_rmse$penalty)
+
+# 3. Turn dgCMatrix into a tidy data frame
+coef_df <- data.frame(
+  term     = rownames(coef_mat),
+  estimate = as.numeric(coef_mat)
+) %>%
+  # remove intercept + zero coefficients
+  filter(term != "(Intercept)", estimate != 0) %>%
+  # sort by absolute magnitude
+  mutate(
+    abs_est   = abs(estimate),
+    term      = fct_reorder(term, abs_est),
+    term_clean = str_wrap(term, width = 22)  # wrap long labels
+  ) %>%
+  arrange(abs_est)
+
+# 4. Plot – readable, high-res version
+ggplot(coef_df, aes(x = estimate, y = term_clean)) +
+  geom_point(color = "#0072B2", size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title    = "LASSO Coefficients (λ = Optimal, Intercept Removed)",
+    subtitle = "Predictors are standardized → coefficient magnitudes are comparable.",
+    x        = "Coefficient value",
+    y        = "Predictor"
+  ) +
+  theme_bw(base_size = 18) +
+  theme(
+    plot.title        = element_text(face = "bold"),
+    axis.text.y       = element_text(size = 12),
+    panel.grid.major.y = element_blank()
+  )
+
+
+```
+
+#### Ranking of LASSO-Selected Numeric Predictors by \|t\|-Statistic
+
+```{r lasso-tstats, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+
+
+
+# -------------------------------------------------------------
+
+# 1) Extract glmnet model and non-zero coefficients
+
+# -------------------------------------------------------------
+
+glmnet_model <- extract_fit_parsnip(final_lasso_fit)$fit
+
+coef_mat <- coef(glmnet_model, s = best_rmse$penalty)
+
+selected_vars_raw <- rownames(coef_mat)[as.numeric(coef_mat) != 0]
+selected_vars_raw <- selected_vars_raw[selected_vars_raw != "(Intercept)"]
+
+# -------------------------------------------------------------
+
+# 2) Restrict to numeric, existing, formula-safe predictors
+
+# -------------------------------------------------------------
+
+# (a) Only columns that exist AND are numeric in model_data_scaled
+
+numeric_cols <- names(model_data_scaled)[sapply(model_data_scaled, is.numeric)]
+
+candidate_vars <- intersect(selected_vars_raw, numeric_cols)
+
+# (b) Drop location, tier dummies and factor-style names, and keep formula-safe ones
+
+clean_vars <- candidate_vars %>%
+.[!grepl("^İkamet İl", .)] %>%         # drop location dummies if any
+.[!grepl("^Tier_", .)] %>%             # drop tier dummies if any
+.[!grepl("^f_", .)] %>%                # drop factor-style names if any
+.[grepl("^[A-Za-z0-9_\\.]+$", .)]
+      # keep only formula-safe names
+
+# Quick check
+
+print(clean_vars)
+
+# If this accidentally becomes empty, stop with a clear message
+
+if (length(clean_vars) == 0) {
+stop("No valid numeric LASSO-selected predictors left after cleaning.")
+}
+
+# -------------------------------------------------------------
+
+# 3) Build OLS formula using only these numeric predictors
+
+# -------------------------------------------------------------
+
+formula_lasso_ols <- reformulate(
+termlabels = clean_vars,
+response   = "log_income"
+)
+
+print(formula_lasso_ols)
+
+# -------------------------------------------------------------
+
+# 4) Fit OLS model to obtain classical t-statistics
+
+# -------------------------------------------------------------
+
+model_ols <- lm(formula_lasso_ols, data = model_data_scaled)
+
+# -------------------------------------------------------------
+
+# 5) Extract and plot |t-statistics|
+
+# -------------------------------------------------------------
+
+t_df <- tidy(model_ols) %>%
+dplyr::filter(term != "(Intercept)") %>%
+dplyr::mutate(
+abs_t      = abs(statistic),
+term_clean = stringr::str_wrap(term, width = 25)
+) %>%
+
+# order by |t| and freeze that order in the factor levels
+
+dplyr::arrange(abs_t) %>%
+dplyr::mutate(
+term_clean = factor(term_clean, levels = term_clean)
+)
+
+ggplot(t_df, aes(x = abs_t, y = term_clean)) +
+geom_col(fill = "#E58F65") +
+labs(
+title    = "Absolute t-statistics from OLS refit on LASSO-selected predictors",
+subtitle = "Larger bars indicate stronger marginal significance (in the OLS sense).",
+x        = "|t-statistic|",
+y        = NULL
+) +
+theme_bw(base_size = 16) +
+theme(
+plot.title  = element_text(face = "bold"),
+axis.text.y = element_text(size = 11)
+)
+
+
+```
+
+LASSO identifies influential predictors by shrinking coefficients through an ℓ1​ penalty, which prioritizes predictive contribution rather than classical statistical significance.As a result, a variable may receive a non-zero LASSO coefficient even if its marginal linear effect is weak. To assess this difference we refitted an OLS model using only the LASSO-selected predictors and examined the resulting absolute t-statistics (\|t\|).
+
+Overall, the comparison reveals that the strongest LASSO coefficients tend to align with the predictors exhibiting the highest \|t\| values, such as standardized delinquency counts and payment-capacity features.This consistency suggests that LASSO is selecting variables that are not only useful for prediction but also retain statistical relevance in a linear environment.
+
+## 10.4 Feature Importance Comparison: Linear vs Non-Linear
+
+```{r feature-importance-heatmap, message=FALSE, warning=FALSE, fig.width=15, fig.height=8, column="screen-left"}
+library(tidymodels)
+library(vip)
+library(dplyr)
+library(ggplot2)
+
+extract_vi <- function(model_res) {
+  fit <- extract_fit_parsnip(model_res$fit[[1]])
+  vi(fit)
+}
+
+dt_imp    <- extract_vi(res_tree)   %>% mutate(Model = "Decision Tree")
+rf_imp    <- extract_vi(res_rf)     %>% mutate(Model = "Random Forest")
+lasso_imp <- extract_vi(res_lasso)  %>% mutate(Model = "LASSO")
+xgb_imp   <- extract_vi(res_xgb)    %>% mutate(Model = "XGBoost")
+lgbm_imp  <- extract_vi(res_lgbm)   %>% mutate(Model = "LightGBM")
+
+all_imp <- bind_rows(dt_imp, rf_imp, lasso_imp, xgb_imp, lgbm_imp) %>%
+  rename(Feature = Variable, Importance = Importance) %>%
+  group_by(Model) %>%
+  slice_max(order_by = Importance, n = 10) %>%
+  mutate(Feature = reorder(Feature, Importance)) %>%
+  ungroup()
+
+all_imp$Model <- factor(all_imp$Model,
+                        levels = c("Decision Tree", "Random Forest", "LASSO", "XGBoost", "LightGBM"))
+
+model_colors <- c(
+  "Decision Tree" = "#F8766D",
+  "Random Forest" = "#00BFC4",
+  "LASSO"         = "#B79F00",
+  "XGBoost"       = "#F564E3",
+  "LightGBM"      = "#00BA38"
+)
+
+ggplot(all_imp, aes(x = Importance, y = Feature, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Model, scales = "free", ncol = 3) +
+  scale_fill_manual(values = model_colors) +
+  labs(
+    title = "Feature Importance Across Different Models",
+    subtitle = "Top predictors driving income predictions in each algorithm",
+    x = "Importance Score",
+    y = NULL
+  ) +
+  theme_bw(base_size = 18) +
+  theme(
+    plot.title = element_text(face = "bold", size = 20),
+    strip.text = element_text(face = "bold", size = 16),
+    axis.text.y = element_text(size = 13),
+    panel.grid.major.y = element_blank()
+  )
+
+  
+```
+
+Figure Comparing which variables drive predictions in each algorithm, compares the top predictors identified by five different algorithms Decision Tree, Random Forest, LASSO, XGBoost, and LightGBM. Despite using fundamentally different modeling paradigms (linear shrinkage vs. tree-based non-linear splits), the models consistently highlight the same core set of variables as the strongest drivers of income: credit score (KKB_SCORE), credit limit (KKB_CC_OPEN_TOT_LIM_AMT), credit tenure (KKB_CUST_TENURE), credit card utilization (KKB_CC_UTIL_RATIO), and age-related features. This convergence across models indicates that these predictors possess a robust, model-independent signal and are structurally important in explaining income.
+
+LASSO additionally prioritizes education- and employment-status dummies because linear models rely more heavily on categorical indicators when capturing structural differences across subgroups. Meanwhile, tree-based models (Random Forest, XGBoost, LightGBM) focus more on numeric credit-behaviour variables because they can naturally exploit non-linear thresholds in these features.
+
+The alignment across models confirms that credit-bureau behavioural variables dominate the predictive structure, while human-capital markers (education, employment status) contribute secondary but consistent effects. The fact that different models never disagree radically strengthens the reliability and stability of the income prediction signal.
+
+```{r feature-importance, message=FALSE, warning=FALSE, fig.width=15, fig.height=8, column="screen-left"}
+
+
+library(tidymodels)
+library(vip)
+library(dplyr)
+library(ggplot2)
+
+# ---- 1. Helper: extract raw importance from each fitted model ----
+get_vi <- function(model_res, model_name) {
+  fit_obj <- extract_fit_parsnip(model_res$fit[[1]])
+  vi(fit_obj) %>%
+    mutate(Model = model_name)
+}
+
+# ---- 2. Stack importance scores from all models ----
+vip_all <- bind_rows(
+  get_vi(res_tree,  "Decision Tree"),
+  get_vi(res_rf,    "Random Forest"),
+  get_vi(res_lasso, "LASSO"),
+  get_vi(res_xgb,   "XGBoost"),
+  get_vi(res_lgbm,  "LightGBM")
+)
+
+# ---- 3. Keep globally most important features & rescale within model ----
+# 3a) pick top 20 features across all models (by max importance)
+top_features <- vip_all %>%
+  group_by(Variable) %>%
+  summarise(max_imp = max(Importance, na.rm = TRUE), .groups = "drop") %>%
+  slice_max(order_by = max_imp, n = 20) %>%
+  arrange(desc(max_imp)) %>%
+  pull(Variable)
+
+# 3b) filter to those features and rescale to [0,1] within each model
+vip_heat <- vip_all %>%
+  filter(Variable %in% top_features) %>%
+  group_by(Model) %>%
+  mutate(RelativeImportance = Importance / max(Importance, na.rm = TRUE)) %>%
+  ungroup()
+
+# 3c) order features for y-axis using global importance
+feature_order <- vip_heat %>%
+  group_by(Variable) %>%
+  summarise(global_imp = max(RelativeImportance, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(global_imp)) %>%
+  pull(Variable)
+
+vip_heat <- vip_heat %>%
+  mutate(
+    Variable = factor(Variable, levels = rev(feature_order)),
+    Model = factor(
+      Model,
+      levels = c("Decision Tree", "Random Forest", "LASSO", "XGBoost", "LightGBM")
+    )
+  )
+
+# ---- 4. Heatmap plot ----
+ggplot(vip_heat, aes(x = Model, y = Variable, fill = RelativeImportance)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(
+    name = "Relative importance",
+    option = "plasma",
+    limits = c(0, 1)
+  ) +
+  labs(
+    title    = "Feature Importance Across Different Models",
+    subtitle = "Importance is rescaled within each model (1 = most important feature)",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw(base_size = 18) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 20),
+    plot.subtitle   = element_text(size = 14),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    panel.grid      = element_blank()
+  )
+
+
+```
+
+# **11. Regional Rent Analysis**
+
+This section investigates how provincial average rent levels (used as a proxy for local cost of living) relate to declared income and educational attainment.
+
+## 11.1 Correlation Between Average Rent and Income
+
+We first compute the correlation between the provincial average rent (`kira_il_ortalama`) and the declared e-government income:
+
+```{r}
+cor(df$kira_il_ortalama, df$Edevlet_Net_Gelir,
+    use = "pairwise.complete.obs")
+
+```
+
+The correlation is positive, indicating that individuals residing in high-rent regions tend to report higher incomes. This aligns with the expected relationship between cost of living and earning capacity in metropolitan areas.
+
+## 11.2 — Income Distribution Across Rent Quartiles
+
+```{r}
+library(ggplot2)
+
+df %>%
+  mutate(rent_quartile = ntile(kira_il_ortalama, 4)) %>%
+  ggplot(aes(x = factor(rent_quartile), y = Edevlet_Net_Gelir)) +
+  geom_boxplot(fill = "#4A90E2", alpha = 0.7) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Income Distribution Across Rent Quartiles",
+    x = "Rent Quartile (1 = Lowest Cost Regions)",
+    y = "Declared Income (₺)"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+## 11.3 Average Rent Levels Across Income Quartiles
+
+```{r}
+df %>%
+  mutate(income_group = ntile(Edevlet_Net_Gelir, 4)) %>%
+  group_by(income_group) %>%
+  summarise(
+    avg_rent = mean(kira_il_ortalama, na.rm = TRUE)
+  )
+
+```
+
+## 11.4 — Mean Rent by Income Quartile
+
+```{r}
+df %>%
+  mutate(income_quartile = ntile(Edevlet_Net_Gelir, 4)) %>%
+  ggplot(aes(x = factor(income_quartile), y = kira_il_ortalama)) +
+  geom_bar(stat = "summary", fun = "mean", fill = "#7E57C2") +
+  labs(
+    title = "Average Rent Levels Across Income Quartiles",
+    x = "Income Quartile",
+    y = "Average Rent (₺)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+```
+
+## 11.5 Effect of Rent in the Main Regression Model
+
+```{r}
+
+
+coef_rent <- coef(summary(lm_fit))["t_RentIl", ]
+
+coef_rent
+
+```
+
+```{r rent-histogram, message=FALSE, warning=FALSE, fig.width=12, fig.height=6, column="screen-left"}
+
+library(dplyr)
+library(ggplot2)
+
+model_data_scaled %>%
+  ggplot(aes(x = kira_il_ortalama)) +
+  geom_histogram(
+    bins = 40,
+    fill = "#00BFC4",
+    color = "white",
+    alpha = 0.85
+  ) +
+  labs(
+    title    = "Distribution of City-Level Average Rents",
+    subtitle = "Histogram of kira_il_ortalama across all customers",
+    x        = "Average monthly rent (TL)",
+    y        = "Count"
+  ) +
+  theme_bw(base_size = 18)
+
+
+```
+
+```{r rent-histogram-by-income, message=FALSE, warning=FALSE, fig.width=14, fig.height=7, column="screen-left"}
+
+library(dplyr)
+library(ggplot2)
+
+model_data_scaled %>%
+  mutate(income_group = ntile(Edevlet_Net_Gelir, 4)) %>%
+  ggplot(aes(x = kira_il_ortalama)) +
+  geom_histogram(
+    bins = 30,
+    fill = "#F8766D",
+    color = "white",
+    alpha = 0.85
+  ) +
+  facet_wrap(~ income_group, nrow = 2) +
+  labs(
+    title    = "Rent Distribution by Income Quartiles",
+    subtitle = "Income groups created using ntile(Edevlet_Net_Gelir, 4)",
+    x        = "Average monthly rent (TL)",
+    y        = "Count"
+  ) +
+  scale_x_continuous(labels = scales::comma) +
+  theme_bw(base_size = 18)
+
+
+```
+
+```{r}
+model_data_scaled %>%
+mutate(income_group = ntile(Edevlet_Net_Gelir, 4)) %>%
+ggplot(aes(x = factor(income_group), y = kira_il_ortalama)) +
+geom_boxplot(fill = "#F8766D", alpha = 0.8, outlier.alpha = 0.4) +
+labs(
+title    = "Rent Distribution by Income Quartiles",
+subtitle = "Boxplots show median and spread of rent for each income group",
+x        = "Income quartile (based on Edevlet_Net_Gelir)",
+y        = "Monthly rent (TL)"
+) +
+scale_y_continuous(labels = scales::comma) +
+theme_bw(base_size = 16)
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+rent_summary <- model_data_scaled %>%
+mutate(income_group = ntile(Edevlet_Net_Gelir, 4)) %>%
+group_by(income_group) %>%
+summarise(
+avg_rent = mean(kira_il_ortalama, na.rm = TRUE),
+sd_rent  = sd(kira_il_ortalama,  na.rm = TRUE),
+n        = n(),
+se_rent  = sd_rent / sqrt(n)
+)
+
+ggplot(rent_summary, aes(x = factor(income_group), y = avg_rent)) +
+geom_col(fill = "#00BFC4", alpha = 0.9) +
+geom_errorbar(
+aes(ymin = avg_rent - se_rent, ymax = avg_rent + se_rent),
+width = 0.15,
+linewidth = 0.7
+) +
+labs(
+title    = "Average Rent by Income Quartiles",
+subtitle = "Bars show mean rent; error bars show ±1 SE",
+x        = "Income quartile (based on Edevlet_Net_Gelir)",
+y        = "Average monthly rent (TL)"
+) +
+scale_y_continuous(labels = scales::comma) +
+theme_bw(base_size = 16)
+
+```
+
+```{r}
+shiny::runApp("~/Downloads/income_prediction_app_production.R")
+```

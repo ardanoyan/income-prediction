@@ -1,0 +1,10 @@
+data/*.xlsx
+shiny/extreme_values/data/
+shiny/dss/deployment/*.rds
+*_files/
+*.html
+.Rproj.user/
+.Rhistory
+.RData
+__pycache__/
+.DS_Store
