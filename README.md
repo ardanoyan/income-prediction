@@ -5,10 +5,11 @@ for Hayat Finans A.S. (a digital bank in Türkiye). Team of six, academic adviso
 industry advisor Alperen Dogan. This repository holds the parts I wrote: the modelling notebook, the two
 Shiny apps, and the deployment helper. The project poster is in [`docs/`](docs/HYFGT_poster.pdf).
 
-**No customer data is in this repository.** The bank's extract is confidential. `scripts/make_synthetic_data.py`
-writes a synthetic table with the same 123-column schema and plausible ranges, with a planted relationship
-between income and age, bureau score, card limit, education, employment and city, so that every notebook
-chunk and both apps run end to end. Numbers computed on it are illustrative only.
+The project was built on the bank's own customer extract, and every result quoted below comes from that data.
+**The extract is confidential and is not in this repository.** So that the notebook and the apps can still be run,
+`scripts/make_synthetic_data.py` writes a synthetic table with the same 123-column schema and plausible ranges,
+with a planted relationship between income and age, bureau score, card limit, education, employment and city.
+Numbers computed on the synthetic table are illustrative only.
 
 ![Project poster](docs/poster.png)
 
